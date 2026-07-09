@@ -1,5 +1,3 @@
-import type { Config, Plugin } from "@opencode-ai/plugin";
-
 /**
  * OpenCode plugin that auto-discovers models from OpenAI-compatible providers.
  *
@@ -15,40 +13,22 @@ import type { Config, Plugin } from "@opencode-ai/plugin";
 const DEFAULT_TIMEOUT_MS = 5000;
 const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000;
 
-const cache = new Map<string, { models: ModelMap; fetchedAt: number }>();
+const cache = new Map();
 
-type ModelLimits = {
-  context: number;
-  output: number;
-};
-
-type ModelMap = Record<string, any>;
-
-type ModelLimitRule = {
-  pattern: RegExp;
-  limits: ModelLimits;
-};
-
-type ModelLimitRuleInput = {
-  pattern: string;
-  context: number;
-  output: number;
-};
-
-const DEFAULT_LIMITS: ModelLimits = {
+const DEFAULT_LIMITS = {
   context: 128000,
   output: 16384,
 };
 
 // Built-in heuristics for common upstream model families.
 // External rules passed via config take precedence over these.
-const BUILT_IN_LIMIT_RULES: ModelLimitRule[] = [
+const BUILT_IN_LIMIT_RULES = [
   { pattern: /kimi-k2\.7/i, limits: { context: 262144, output: 32768 } },
   { pattern: /kimi-k2\.6/i, limits: { context: 262144, output: 32768 } },
   { pattern: /kimi-k2\.5/i, limits: { context: 262144, output: 32768 } },
 ];
 
-function compileLimitRules(rules?: ModelLimitRuleInput[]): ModelLimitRule[] {
+function compileLimitRules(rules) {
   if (!Array.isArray(rules)) return [];
   return rules.map((rule) => ({
     limits: { context: rule.context, output: rule.output },
@@ -56,11 +36,7 @@ function compileLimitRules(rules?: ModelLimitRuleInput[]): ModelLimitRule[] {
   }));
 }
 
-function inferModelLimits(
-  modelId: string,
-  rules: ModelLimitRule[],
-  defaults: ModelLimits
-): ModelLimits {
+function inferModelLimits(modelId, rules, defaults) {
   for (const rule of rules) {
     if (rule.pattern.test(modelId)) {
       return rule.limits;
@@ -69,11 +45,7 @@ function inferModelLimits(
   return defaults;
 }
 
-function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-  timeoutMs: number
-): Promise<Response> {
+function fetchWithTimeout(url, init, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   return fetch(url, { ...init, signal: controller.signal }).finally(() =>
@@ -81,7 +53,7 @@ function fetchWithTimeout(
   );
 }
 
-export const AutoModelsPlugin: Plugin = async ({ client }, options) => {
+export const AutoModelsPlugin = async ({ client }, options) => {
   const dryRun = options?.dryRun === true;
   const timeoutMs =
     typeof options?.timeout === "number" ? options.timeout : DEFAULT_TIMEOUT_MS;
@@ -91,7 +63,7 @@ export const AutoModelsPlugin: Plugin = async ({ client }, options) => {
       : DEFAULT_CACHE_TTL_MS;
 
   return {
-    config: async (config: Config) => {
+    config: async (config) => {
       const providers = config.provider ?? {};
 
       for (const [providerId, provider] of Object.entries(providers)) {
@@ -123,7 +95,7 @@ export const AutoModelsPlugin: Plugin = async ({ client }, options) => {
           continue;
         }
 
-        const providerDefaultLimits: ModelLimits = {
+        const providerDefaultLimits = {
           context:
             typeof opts.autoModelsContext === "number"
               ? opts.autoModelsContext
@@ -139,8 +111,8 @@ export const AutoModelsPlugin: Plugin = async ({ client }, options) => {
         };
 
         const externalRules = [
-          ...compileLimitRules(opts.modelLimits as ModelLimitRuleInput[] | undefined),
-          ...compileLimitRules(options && (options as { modelLimits?: ModelLimitRuleInput[] }).modelLimits),
+          ...compileLimitRules(opts.modelLimits),
+          ...compileLimitRules(options?.modelLimits),
         ];
         const limitRules = [...externalRules, ...BUILT_IN_LIMIT_RULES];
 
@@ -157,12 +129,11 @@ export const AutoModelsPlugin: Plugin = async ({ client }, options) => {
 
         // Check in-memory cache so we don't hit the API on every config reload.
         const cached = cache.get(providerId);
-        let discovered: ModelMap = {};
+        let discovered = {};
 
         if (cached && Date.now() - cached.fetchedAt < cacheTtlMs) {
           discovered = cached.models;
         } else {
-
           try {
             const url = new URL(
               "models",
@@ -185,10 +156,7 @@ export const AutoModelsPlugin: Plugin = async ({ client }, options) => {
               );
             }
 
-            const body = (await response.json()) as {
-              data?: Array<{ id?: string; name?: string }>;
-            };
-
+            const body = await response.json();
             const data = body?.data ?? [];
 
             for (const model of data) {
@@ -221,7 +189,7 @@ export const AutoModelsPlugin: Plugin = async ({ client }, options) => {
               });
             }
           } catch (err) {
-            const message = (err as Error).message;
+            const message = err?.message ?? String(err);
             await client.app.log({
               body: {
                 service: "auto-models",
@@ -236,14 +204,14 @@ export const AutoModelsPlugin: Plugin = async ({ client }, options) => {
         if (Object.keys(discovered).length === 0) continue;
 
         // Merge discovered models with any manual overrides. Manual entries win.
-        const merged: ModelMap = { ...discovered };
+        const merged = { ...discovered };
         if (existingModels) {
-          for (const [id, manual] of Object.entries(existingModels as ModelMap)) {
+          for (const [id, manual] of Object.entries(existingModels)) {
             merged[id] = { ...discovered[id], ...manual };
           }
         }
 
-        provider.models = merged as NonNullable<Config["provider"]>["string"]["models"];
+        provider.models = merged;
       }
     },
   };
