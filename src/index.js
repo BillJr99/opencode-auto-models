@@ -331,40 +331,82 @@ function createV1Hooks({ client }, options) {
 
 /**
  * v2 removed the mutable global config object and the `config` hook with it.
- * The replacement is a per-domain transform: provider settings and model
- * inventories are edited through `ctx.provider.transform(editor => ...)`.
+ * Provider inventories are edited through `ctx.provider.transform`.
  *
- * Read a provider record's connection settings. v2's own docs show these under
- * `info.settings`, but the record shape is not pinned down by any published
- * schema, so the alternatives are probed rather than assumed. A record whose
- * settings cannot be located is reported by name instead of skipped silently.
+ * Two constraints shape the code below. The transform callback must be
+ * synchronous, and it is replayed on every rebuild, so all network work happens
+ * before it and only the assignment happens inside. And v2 models are
+ * `Model.Info` records with a fixed shape, not the loose `{name, limit,
+ * modalities}` entries v1 accepts.
  */
+
+/** Documented shape is ProviderRecord.provider; the rest are tolerated fallbacks. */
+function readProviderInfo(record) {
+  return record?.provider ?? record?.info ?? record ?? null;
+}
+
 function readProviderSettings(record) {
-  return record?.info?.settings ?? record?.settings ?? record?.info?.options ?? record?.options ?? null;
+  const info = readProviderInfo(record);
+  return info?.settings ?? info?.options ?? null;
 }
 
-function readProviderPackage(record) {
-  return record?.info?.package ?? record?.package ?? record?.info?.npm ?? record?.npm ?? null;
-}
-
-/**
- * Reshape a v1 provider record into the shape the discovery core expects, so
- * both runtimes share one code path for eligibility, filtering and limits.
- */
+/** Reshape a v2 record so the shared discovery core can judge eligibility. */
 function asDiscoveryProvider(record) {
-  const settings = readProviderSettings(record) ?? {};
-  const pkg = readProviderPackage(record);
+  const info = readProviderInfo(record) ?? {};
+  const pkg = info.package ?? info.npm;
   return {
-    // v2 package ids end in the same driver name the v1 `npm` field carries.
     npm: typeof pkg === "string" && pkg.includes("openai-compatible") ? "@ai-sdk/openai-compatible" : pkg,
-    options: settings,
+    options: readProviderSettings(record) ?? {},
     models: undefined,
   };
 }
 
-async function runV2Discovery(ctx, options) {
+/**
+ * Build a v2 Model.Info. v1 carries `modalities`; v2 carries the same
+ * information under `capabilities`, alongside required bookkeeping fields.
+ */
+function toModelInfo(providerID, modelID, model) {
+  return {
+    id: modelID,
+    modelID,
+    providerID,
+    name: model.name ?? modelID,
+    capabilities: {
+      tools: true,
+      input: model.modalities?.input ?? ["text"],
+      output: model.modalities?.output ?? ["text"],
+    },
+    variants: [],
+    time: { released: 0 },
+    cost: [],
+    status: "active",
+    enabled: true,
+    limit: { context: model.limit?.context, output: model.limit?.output },
+  };
+}
+
+async function loadDiscoveries(ctx, settings, log) {
+  const records = (await ctx.provider.list?.()) ?? [];
+  const providers = {};
+
+  for (const record of records) {
+    const info = readProviderInfo(record);
+    const id = info?.id;
+    if (!id) continue;
+
+    if (!readProviderSettings(record)) {
+      await log("warn", "setup", `Cannot read connection settings for provider ${id}; skipping it`);
+      continue;
+    }
+    providers[id] = asDiscoveryProvider(record);
+  }
+
+  return discoverAll(providers, settings, log);
+}
+
+async function runV2Discovery(ctx) {
   const log = createLogger(ctx?.client ?? { app: { log: async () => {} } });
-  const settings = resolveSettings(options ?? ctx?.options);
+  const settings = resolveSettings(ctx?.options);
 
   await log("info", "setup", "Loaded (v2 entrypoint)");
 
@@ -373,42 +415,37 @@ async function runV2Discovery(ctx, options) {
     return;
   }
 
+  // Held outside the transform so a later reload() replays the callback against
+  // refreshed data without re-running discovery inside it.
+  const source = { discoveries: [] };
+
   try {
-    await ctx.provider.transform(async (editor) => {
-      const records = editor.list();
-      const providers = {};
-      const byId = new Map();
+    source.discoveries = await loadDiscoveries(ctx, settings, log);
+  } catch (e) {
+    await log("error", "setup", `Discovery failed: ${errorDetail(e)}`);
+    return;
+  }
 
-      for (const record of records) {
-        const id = record?.info?.id ?? record?.id;
-        if (!id) continue;
-
-        if (!readProviderSettings(record)) {
-          await log("warn", "setup", `Cannot read connection settings for provider ${id}; skipping it`);
-          continue;
-        }
-
-        providers[id] = asDiscoveryProvider(record);
-        byId.set(id, record);
-      }
-
-      const discoveries = await discoverAll(providers, settings, log);
-
-      for (const { task, discovered } of discoveries) {
-        const models = Object.entries(discovered).map(([id, model]) => ({ id, ...model }));
+  try {
+    await ctx.provider.transform((editor) => {
+      for (const { task, discovered } of source.discoveries) {
+        const models = Object.entries(discovered).map(([id, model]) => toModelInfo(task.providerId, id, model));
         try {
           editor.models.set(task.providerId, models);
-          await log("info", "setup", `Discovered ${models.length} model(s) for ${task.providerId}`, {
-            models: models.map((m) => m.id),
-          });
         } catch (e) {
-          // The model record shape v2 accepts is not pinned by a published
-          // schema. Report the rejection loudly rather than leaving an empty
-          // provider and no explanation.
-          await log("error", "setup", `editor.models.set rejected ${models.length} model(s) for ${task.providerId}: ${errorDetail(e)}`);
+          // Report a rejected record shape by name rather than leaving an empty
+          // provider and no explanation. Synchronous on purpose: the transform
+          // callback cannot await.
+          console.error(`[auto-models:setup] editor.models.set rejected ${models.length} model(s) for ${task.providerId}: ${errorDetail(e)}`);
         }
       }
     });
+
+    for (const { task, discovered } of source.discoveries) {
+      await log("info", "setup", `Discovered ${Object.keys(discovered).length} model(s) for ${task.providerId}`, {
+        models: Object.keys(discovered),
+      });
+    }
   } catch (e) {
     await log("error", "setup", `Provider transform failed: ${errorDetail(e)}`);
   }
@@ -431,7 +468,7 @@ async function runV2Discovery(ctx, options) {
 export default {
   id: "auto-models",
   async setup(ctx) {
-    await runV2Discovery(ctx, ctx?.options);
+    await runV2Discovery(ctx);
   },
   async server(input, options) {
     const { log, hooks } = createV1Hooks(input, options);

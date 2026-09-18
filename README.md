@@ -211,14 +211,16 @@ discovery runs from `setup()` instead and applies its results through
 `ctx.provider.transform(editor => editor.models.set(...))`. Eligibility,
 filtering and limit rules are shared with the v1 path.
 
-Two caveats apply to the v2 path specifically. The provider record shape is read
-defensively, because no published schema pins down where a provider's connection
-settings live, and the model record shape that `editor.models.set` accepts is
-likewise unpinned. If either differs from what this plugin sends, it reports the
-rejection by name rather than leaving you with an empty provider and no
-explanation. The v1 path is covered by the test suite against a stubbed client;
-the v2 path is covered against a stubbed provider domain, not against a live v2
-runtime.
+Two v2 constraints shape the implementation. Transform callbacks must be
+synchronous and are replayed on every rebuild, so all network work happens
+before the callback and only the assignment happens inside it. And v2 models are
+`Model.Info` records with a fixed shape, so what v1 carries as `modalities`
+becomes `capabilities` here, alongside the required bookkeeping fields.
+
+The v1 path is tested against a stubbed client and the v2 path against a stubbed
+provider domain. Neither has been exercised against a live v2 runtime, so if a
+record shape is rejected the plugin reports it by name rather than leaving you
+with an empty provider and no explanation.
 
 ## Model context limits
 
@@ -262,7 +264,8 @@ written both through opencode's logger and to stdout/stderr.
 
 - **Terminal**: `opencode models <provider-id> --print-logs`
 - **Desktop**: the newest file in `~/.local/share/opencode/log`
-  (`%USERPROFILE%\.local\share\opencode\log` on Windows)
+  (`%USERPROFILE%\.local\share\opencode\log` on Windows), or use
+  **Help → Export logs**, which zips the desktop and server logs together.
 
 Start by searching for `[auto-models:AutoModelsPlugin] Loaded`. If that line is
 absent, the plugin was never loaded and the problem is installation, not

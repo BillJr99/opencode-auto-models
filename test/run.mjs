@@ -165,32 +165,43 @@ await test("logs a load line even before any provider is examined", async () => 
 
 // ─── v2 entrypoint ──────────────────────────────────────────────────────────
 
-/** Minimal stand-in for v2's provider domain. */
+/** Stand-in for v2's provider domain, matching the documented record shape. */
 function makeV2Ctx(records, { setThrows = false } = {}) {
   const messages = [];
+  const consoleErrors = [];
   const applied = {};
   return {
     applied,
     messages,
+    consoleErrors,
     ctx: {
       client: { app: { log: async ({ body }) => messages.push(body) } },
       provider: {
-        transform: async (fn) => fn({
-          list: () => records,
-          models: {
-            set: (id, models) => {
-              if (setThrows) throw new Error("invalid model record");
-              applied[id] = models;
-            },
-          },
-        }),
+        list: async () => records,
+        transform: async (fn) => {
+          const original = console.error;
+          console.error = (...a) => consoleErrors.push(a.join(" "));
+          try {
+            const r = fn({
+              models: {
+                set: (id, models) => {
+                  if (setThrows) throw new Error("invalid model record");
+                  applied[id] = models;
+                },
+              },
+            });
+            assert.equal(r, undefined, "the transform callback must be synchronous");
+          } finally {
+            console.error = original;
+          }
+        },
       },
     },
   };
 }
 
 const v2Record = (over = {}) => ({
-  info: {
+  provider: {
     id: "p",
     package: "@opencode/ai/providers/openai-compatible",
     settings: { baseURL: "https://api.example.com/v1", apiKey: "sk-test" },
@@ -202,21 +213,52 @@ await test("v2 setup discovers models and applies them via editor.models.set", a
   const h = makeV2Ctx([v2Record()]);
   await plugin.setup(h.ctx);
   assert.deepEqual(h.applied.p.map((m) => m.id), ["kimi-k2.7-code", "qwen-vl-max", "tiny-1b"]);
-  assert.equal(h.applied.p[0].limit.context, 128000);
+});
+
+await test("v2 models carry the required Model.Info fields", async () => {
+  const h = makeV2Ctx([v2Record()]);
+  await plugin.setup(h.ctx);
+  const m = h.applied.p.find((x) => x.id === "qwen-vl-max");
+  assert.equal(m.modelID, "qwen-vl-max");
+  assert.equal(m.providerID, "p");
+  assert.equal(m.status, "active");
+  assert.equal(m.enabled, true);
+  assert.deepEqual(m.variants, []);
+  assert.deepEqual(m.cost, []);
+  assert.equal(typeof m.time.released, "number");
+  assert.deepEqual(m.limit, { context: 128000, output: 16384 });
+  // v1 `modalities` becomes v2 `capabilities`; there is no `modalities` key.
+  assert.deepEqual(m.capabilities.input, ["text", "image"]);
+  assert.deepEqual(m.capabilities.output, ["text"]);
+  assert.equal(m.capabilities.tools, true);
+  assert.equal(m.modalities, undefined);
+});
+
+await test("v2 transform callback does no async work inside it", async () => {
+  // makeV2Ctx asserts the callback returns undefined rather than a promise:
+  // v2 replays transforms on every rebuild and does not await them.
+  const h = makeV2Ctx([v2Record()]);
+  await plugin.setup(h.ctx);
+  assert.ok(h.applied.p, "models were still applied");
 });
 
 await test("v2 setup reports a rejected models.set instead of failing silently", async () => {
   const h = makeV2Ctx([v2Record()], { setThrows: true });
   await plugin.setup(h.ctx);
-  const text = h.messages.map((m) => m.message).join("\n");
-  assert.match(text, /editor\.models\.set rejected 3 model\(s\) for p: .*invalid model record/s);
+  assert.match(h.consoleErrors.join("\n"), /editor\.models\.set rejected 3 model\(s\) for p: .*invalid model record/s);
 });
 
 await test("v2 setup names a provider whose settings cannot be read", async () => {
-  const h = makeV2Ctx([{ info: { id: "mystery", package: "x" } }]);
+  const h = makeV2Ctx([{ provider: { id: "mystery", package: "x" } }]);
   await plugin.setup(h.ctx);
-  const text = h.messages.map((m) => m.message).join("\n");
-  assert.match(text, /Cannot read connection settings for provider mystery/);
+  assert.match(h.messages.map((m) => m.message).join("\n"), /Cannot read connection settings for provider mystery/);
+});
+
+await test("v2 setup applies the same eligibility rules as v1", async () => {
+  const h = makeV2Ctx([v2Record({ settings: { baseURL: "https://api.example.com/v1", apiKey: "k", autoModels: false } })]);
+  await plugin.setup(h.ctx);
+  assert.equal(h.applied.p, undefined);
+  assert.match(h.messages.map((m) => m.message).join("\n"), /Skipping p: options\.autoModels is false/);
 });
 
 await test("v2 setup reports a runtime with no provider.transform", async () => {

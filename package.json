@@ -33,9 +33,6 @@
     "ai-sdk",
     "openai-compatible"
   ],
-  "peerDependencies": {
-    "@opencode-ai/plugin": "*"
-  },
   "devDependencies": {
     "typescript": "^5.0.0"
   }
