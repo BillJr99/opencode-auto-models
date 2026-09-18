@@ -19,6 +19,15 @@ const MODELS = [{ id: "kimi-k2.7-code" }, { id: "qwen-vl-max" }, { id: "tiny-1b"
 const unhandled = [];
 process.on("unhandledRejection", (e) => unhandled.push(e));
 
+/**
+ * Backstop against a test reaching the developer's real cache directory. Any
+ * test that forgets to disable the cache lands here instead of in
+ * ~/.cache/opencode/auto-models. Tests that pass an explicit `cacheDir` still
+ * win over this, which is what the real-filesystem cases rely on.
+ */
+const SANDBOX = await fs.mkdtemp(path.join(os.tmpdir(), "auto-models-sandbox-"));
+process.env.OPENCODE_AUTO_MODELS_CACHE_DIR = SANDBOX;
+
 let fetchCount = 0;
 let fetchImpl = async (url) => {
   if (String(url).includes("broken")) throw new Error("ECONNREFUSED");
@@ -237,6 +246,11 @@ function makeV2Ctx(records, { setThrows = false } = {}) {
     messages,
     consoleErrors,
     ctx: {
+      // Same reasoning as runHook: without this the v2 path resolves a real
+      // cache directory, and a warm hit schedules a detached refresh whose
+      // completion log lands in whichever test happens to be capturing the
+      // console when it resolves.
+      options: { cache: false },
       client: { app: { log: async ({ body }) => messages.push(body) } },
       provider: {
         list: async () => records,
@@ -352,6 +366,7 @@ await test("setup() is silent when a v1 runtime calls it with a v1 input", async
 await test("setup() still reports a real v2 runtime whose provider domain is broken", async () => {
   const messages = [];
   await plugin.setup({
+    options: { cache: false },
     client: { app: { log: async ({ body }) => messages.push(body) } },
     provider: {},
   });
@@ -646,6 +661,13 @@ await new Promise((r) => setTimeout(r, 50));
 await test("no promise was left unhandled", async () => {
   assert.deepEqual(unhandled.map((e) => String(e)), []);
 });
+
+await test("no test wrote to the real cache directory", async () => {
+  // Anything here escaped its own `cache: false` and would have polluted the
+  // developer's ~/.cache/opencode/auto-models without the sandbox above.
+  assert.deepEqual(await fs.readdir(SANDBOX), []);
+});
+await fs.rm(SANDBOX, { recursive: true, force: true });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);
 for (const f of failures) console.error(`\n${f.name}\n${f.err.stack}`);
