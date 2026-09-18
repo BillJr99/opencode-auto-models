@@ -78,10 +78,31 @@ await test("explains the skip when autoModels is false", async () => {
   assert.match(text, /Skipping p: options\.autoModels is false/);
 });
 
-await test("explains the skip when apiKey is absent", async () => {
-  const { text } = await runHook({ provider: { p: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "https://x/v1" } } } });
-  assert.match(text, /Skipping p: missing options\.apiKey/);
-  assert.match(text, /auth\.json/);
+await test("discovers from an unauthenticated endpoint with no apiKey", async () => {
+  const { config, text } = await runHook({
+    provider: { p: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "https://api.example.com/v1" } } },
+  });
+  assert.equal(Object.keys(config.provider.p.models).length, 3, "a local proxy needs no key");
+  assert.match(text, /p has no options\.apiKey; querying .* unauthenticated/);
+});
+
+await test("omits the Authorization header entirely when there is no apiKey", async () => {
+  let seen;
+  const real = globalThis.fetch;
+  globalThis.fetch = async (url, init) => { seen = init.headers; return real(url, init); };
+  try {
+    await runHook({ provider: { p: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "https://api.example.com/v1" } } } });
+    assert.equal("Authorization" in seen, false, "no Bearer undefined");
+    await runHook({ provider: { p: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "https://api.example.com/v1", apiKey: "sk-x" } } } });
+    assert.equal(seen.Authorization, "Bearer sk-x");
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
+await test("explains the skip when baseURL is absent", async () => {
+  const { text } = await runHook({ provider: { p: { npm: "@ai-sdk/openai-compatible", options: { apiKey: "k" } } } });
+  assert.match(text, /Skipping p: no options\.baseURL/);
 });
 
 await test("explains the skip for a non-openai-compatible driver", async () => {

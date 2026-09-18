@@ -106,12 +106,16 @@ async function sleep(ms) {
 }
 
 async function fetchModels(url, apiKey, timeoutMs, retries, retryDelayMs) {
+  // A local proxy or self-hosted endpoint often needs no credential at all.
+  // Sending `Authorization: Bearer undefined` to one is worse than sending
+  // nothing, so the header is omitted unless a key was configured.
+  const headers = { Accept: "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const response = await fetchWithTimeout(url, {
-        headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
-      }, timeoutMs);
+      const response = await fetchWithTimeout(url, { headers }, timeoutMs);
 
       if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
 
@@ -144,15 +148,24 @@ async function collectProviderTasks(providers, settings, log) {
     const opts = provider.options ?? {};
     const { baseURL, apiKey } = opts;
 
-    if (!baseURL || !apiKey) {
+    if (!baseURL) {
       await log(
         "info",
         "collectProviderTasks",
-        `Skipping ${providerId}: missing ${!baseURL ? "options.baseURL" : "options.apiKey"}. ` +
-          `Auto-discovery needs both to be present in opencode.json; credentials stored via ` +
-          `\`opencode auth login\` (auth.json) are not visible to this plugin.`
+        `Skipping ${providerId}: no options.baseURL, so there is no /models endpoint to query.`
       );
       continue;
+    }
+
+    if (!apiKey) {
+      // Not a skip: unauthenticated endpoints are a normal case.
+      await log(
+        "info",
+        "collectProviderTasks",
+        `${providerId} has no options.apiKey; querying ${baseURL} unauthenticated. ` +
+          `Note that credentials stored via \`opencode auth login\` (auth.json) are not visible ` +
+          `to this plugin, so set options.apiKey here if this endpoint needs one.`
+      );
     }
 
     const isOpenAICompatible = provider.npm === "@ai-sdk/openai-compatible";
