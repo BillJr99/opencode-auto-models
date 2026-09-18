@@ -7,6 +7,7 @@
  *   autoModelsOutput     - default output limit (default: 16384)
  *   autoModelsInclude    - regex to include only matching model IDs
  *   autoModelsExclude    - regex to exclude matching model IDs
+ *   autoModelsCacheTtl   - per-provider cache lifetime in ms
  *   modelLimits          - [{ pattern, context, output }] per-model overrides
  *
  * Plugin options:
@@ -17,12 +18,18 @@
  *   defaultOutput        - fallback output limit
  *   modelLimits          - global per-model overrides
  *   dryRun               - log what would be fetched without mutating the config
+ *   cache                - on-disk model-list cache (default: true)
+ *   cacheDir             - override the cache directory
+ *   cacheTtl             - cache lifetime in ms (default: 86400000, 24h)
+ *   refresh              - ignore cached entries for this run
  */
 
 const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_RETRIES = 1;
 const DEFAULT_RETRY_DELAY_MS = 1000;
 const DEFAULT_LIMITS = { context: 128000, output: 16384 };
+const DEFAULT_CACHE_TTL_MS = 86_400_000;
+const CACHE_VERSION = 1;
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -31,11 +38,23 @@ const DEFAULT_LIMITS = { context: 128000, output: 16384 };
  * (the desktop app) do not. They do capture stdout/stderr into their log file, so
  * every message is mirrored to the console.
  *
- * Both paths are guarded: an unguarded `await client.app.log(...)` that rejects
- * would abort the whole config hook and silently drop every remaining provider.
+ * `client.app.log` is an HTTP round trip to the local opencode server, and the
+ * `config` hook runs on opencode's startup critical path. Awaiting one log call
+ * per provider therefore cost O(providers) sequential round trips before a single
+ * model was fetched. The structured call is now chained onto a queue and never
+ * awaited by the caller: `log()` returns as soon as the synchronous console
+ * mirror is written.
+ *
+ * Chaining rather than firing in parallel keeps messages in order. The only loss
+ * window is a process exit before the queue drains, and the console mirror —
+ * which is what GUI front-ends actually capture — is always already written by
+ * then.
  */
 function createLogger(client) {
-  return async function log(level, where, message, extra) {
+  let queue = Promise.resolve();
+  let transportBroken = false;
+
+  const log = function log(level, where, message, extra) {
     const prefixed = `[auto-models:${where}] ${message}`;
 
     try {
@@ -45,18 +64,31 @@ function createLogger(client) {
       // A console that throws must not take the plugin down with it.
     }
 
-    try {
-      await client.app.log({
-        body: { service: "auto-models", level, message: prefixed, ...(extra ? { extra } : {}) },
+    // One dead transport should produce one line, not one per message.
+    if (transportBroken) return;
+
+    queue = queue
+      .then(() =>
+        client.app.log({
+          body: { service: "auto-models", level, message: prefixed, ...(extra ? { extra } : {}) },
+        })
+      )
+      .catch((e) => {
+        transportBroken = true;
+        try {
+          console.error(
+            `[auto-models:createLogger] client.app.log failed; further structured logs are suppressed: ${errorDetail(e)}`
+          );
+        } catch {
+          // Nothing left to report through.
+        }
       });
-    } catch (e) {
-      try {
-        console.error(`[auto-models:createLogger] client.app.log failed: ${errorDetail(e)}`);
-      } catch {
-        // Nothing left to report through.
-      }
-    }
   };
+
+  /** Drains the queue. Used by tests; never called on the startup path. */
+  log.idle = () => queue;
+
+  return log;
 }
 
 function errorDetail(err) {
@@ -93,9 +125,22 @@ function inferModalities(modelId) {
   return { input: [...new Set(input)], output };
 }
 
+/**
+ * An 8s abort timer that is never unref'd holds the event loop open long after
+ * the request it guarded has settled.
+ */
+function unrefTimer(timer) {
+  try {
+    timer?.unref?.();
+  } catch {
+    // A runtime whose timers are plain numbers has nothing to unref.
+  }
+  return timer;
+}
+
 function fetchWithTimeout(url, init, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = unrefTimer(setTimeout(() => controller.abort(), timeoutMs));
   return fetch(url, { ...init, signal: controller.signal }).finally(() =>
     clearTimeout(timer)
   );
@@ -129,6 +174,192 @@ async function fetchModels(url, apiKey, timeoutMs, retries, retryDelayMs) {
   throw lastErr;
 }
 
+// ─── Model-list cache ───────────────────────────────────────────────────────
+
+/**
+ * Without a cache, every opencode start re-fetches every provider's /models
+ * before the model catalog can be built. Discovery cannot simply be detached
+ * instead: opencode awaits the `config` hook and only then reads `cfg.provider`,
+ * so a hook that returns early yields a catalog with no models, and v1 exposes
+ * no way to rebuild it afterwards. The fix is therefore to take the *network*
+ * off the startup path rather than the await — serve startup from disk and
+ * refresh in the background for the next start.
+ *
+ * What is cached is the raw `/models` payload, never the built model map.
+ * Filters, limit rules and modality inference are applied afterwards in
+ * `buildModelMap`, so editing `autoModelsExclude` or `modelLimits` takes effect
+ * on the very next start with no network and no cache bust.
+ */
+
+/** Memoized so N providers trigger one import, not N. */
+let fsModulePromise;
+function loadFs() {
+  if (!fsModulePromise) {
+    // A static import would break the plugin at *load* time on any runtime
+    // without node:fs, which would end the copy-one-file install story. The
+    // rejection is handled here at creation, so it can never surface as an
+    // unhandled rejection even if no caller ever awaits this.
+    fsModulePromise = import("node:fs/promises").then(
+      (m) => m,
+      () => null
+    );
+  }
+  return fsModulePromise;
+}
+
+function readEnv() {
+  return typeof process !== "undefined" && process?.env ? process.env : {};
+}
+
+function readPlatform() {
+  return typeof process !== "undefined" && process ? process.platform : "";
+}
+
+/** FNV-1a, inline, so the file keeps its no-dependency guarantee (no node:crypto). */
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/**
+ * Co-located under opencode's own cache root, so "delete ~/.cache/opencode"
+ * remains the universal reset — the README already points users there for
+ * `packages/`.
+ */
+function resolveCacheDir(options, env, sep) {
+  if (typeof options?.cacheDir === "string" && options.cacheDir) return options.cacheDir;
+  if (env.OPENCODE_AUTO_MODELS_CACHE_DIR) return env.OPENCODE_AUTO_MODELS_CACHE_DIR;
+  if (env.XDG_CACHE_HOME) return [env.XDG_CACHE_HOME, "opencode", "auto-models"].join(sep);
+  // On Windows, opencode itself uses the dot-directory layout rather than
+  // AppData (%USERPROFILE%\.config\opencode\plugins,
+  // %USERPROFILE%\.local\share\opencode\log), so matching it is what keeps
+  // "delete the opencode cache directory" a single instruction on every OS.
+  if (sep === "\\" && env.USERPROFILE) return [env.USERPROFILE, ".cache", "opencode", "auto-models"].join(sep);
+  if (env.HOME) return [env.HOME, ".cache", "opencode", "auto-models"].join(sep);
+  if (env.LOCALAPPDATA) return [env.LOCALAPPDATA, "opencode", "auto-models"].join(sep);
+  return null;
+}
+
+/**
+ * Provider ids come from user config, so an id of `../../../etc` must not be
+ * able to escape the cache directory. The slug is also what makes the directory
+ * legible to a human running `ls`.
+ */
+function slugifyProviderId(providerId) {
+  return (
+    String(providerId)
+      .replace(/[^A-Za-z0-9._-]/g, "_")
+      // Collapse dot runs and strip leading punctuation so the result cannot be
+      // `..`, a dotfile, or anything else a shell or a glob treats specially.
+      .replace(/\.{2,}/g, "_")
+      .replace(/^[._-]+/, "")
+      .slice(0, 40) || "provider"
+  );
+}
+
+/**
+ * Keyed on the resolved URL and on a fingerprint of the credential, because
+ * rotating to a different account's key can legitimately change the model list
+ * and a plain "keyed/anon" bit would serve the old account's models for a whole
+ * TTL. The fingerprint only ever feeds this filename; no credential material is
+ * written into the cache file.
+ */
+function cacheKeyFor(providerId, url, apiKey) {
+  return `${slugifyProviderId(providerId)}.${fnv1a(`${url} ${apiKey ? fnv1a(apiKey) : "anon"}`)}`;
+}
+
+function createNullStore() {
+  return { dir: null, async read() { return null; }, async write() {} };
+}
+
+function createFsStore(dir, sep, log) {
+  let writable = true;
+  let ensured = null;
+  const pathFor = (key) => `${dir}${sep}${key}.json`;
+
+  return {
+    dir,
+    async read(key) {
+      const fs = await loadFs();
+      if (!fs) return null;
+      try {
+        return await fs.readFile(pathFor(key), "utf8");
+      } catch {
+        // A missing file, an unreadable directory and a runtime without fs are
+        // all just a cache miss.
+        return null;
+      }
+    },
+    async write(key, text) {
+      if (!writable) return;
+      const fs = await loadFs();
+      if (!fs) {
+        writable = false;
+        return;
+      }
+
+      const target = pathFor(key);
+      const tmp = `${target}.${Math.random().toString(36).slice(2)}.tmp`;
+
+      try {
+        if (!ensured) ensured = fs.mkdir(dir, { recursive: true, mode: 0o700 });
+        await ensured;
+        await fs.writeFile(tmp, text, { mode: 0o600 });
+        // Atomic on POSIX, and replace-semantics on Windows, so a second
+        // opencode instance can never observe a half-written file.
+        await fs.rename(tmp, target);
+      } catch (e) {
+        writable = false;
+        ensured = null;
+        log("warn", "createFsStore", `Cannot write the model cache at ${dir}; continuing without it: ${errorDetail(e)}`);
+        try {
+          await fs.unlink(tmp);
+        } catch {
+          // The temp file may never have been created.
+        }
+      }
+    },
+  };
+}
+
+function serializeEntry(task, data, now) {
+  return JSON.stringify({
+    v: CACHE_VERSION,
+    providerId: task.providerId,
+    url: task.url,
+    keyed: !!task.apiKey,
+    savedAt: now,
+    data,
+  });
+}
+
+/** Anything unparseable, versioned differently or written for another URL is a miss. */
+function readEntry(text, task, now) {
+  if (typeof text !== "string") return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+
+  if (!parsed || parsed.v !== CACHE_VERSION) return null;
+  if (parsed.providerId !== task.providerId || parsed.url !== task.url) return null;
+  if (!Array.isArray(parsed.data)) return null;
+
+  const savedAt = typeof parsed.savedAt === "number" ? parsed.savedAt : 0;
+  // A savedAt in the future — clock skew, a resumed VM — must never read as
+  // fresh, or a bad clock pins the entry forever.
+  const age = savedAt > now ? Infinity : now - savedAt;
+
+  return { data: parsed.data, savedAt, age };
+}
+
 // ─── Discovery core (runtime-agnostic) ──────────────────────────────────────
 
 /**
@@ -136,12 +367,12 @@ async function fetchModels(url, apiKey, timeoutMs, retries, retryDelayMs) {
  * Every skip here used to be a silent `continue`, which made a non-working
  * plugin indistinguishable from a working one on any GUI front-end.
  */
-async function collectProviderTasks(providers, settings, log) {
+function collectProviderTasks(providers, settings, log) {
   const tasks = [];
 
   for (const [providerId, provider] of Object.entries(providers)) {
     if (!provider || typeof provider !== "object") {
-      await log("warn", "collectProviderTasks", `Skipping ${providerId}: provider entry is not an object`);
+      log("warn", "collectProviderTasks", `Skipping ${providerId}: provider entry is not an object`);
       continue;
     }
 
@@ -149,7 +380,7 @@ async function collectProviderTasks(providers, settings, log) {
     const { baseURL, apiKey } = opts;
 
     if (!baseURL) {
-      await log(
+      log(
         "info",
         "collectProviderTasks",
         `Skipping ${providerId}: no options.baseURL, so there is no /models endpoint to query.`
@@ -159,7 +390,7 @@ async function collectProviderTasks(providers, settings, log) {
 
     if (!apiKey) {
       // Not a skip: unauthenticated endpoints are a normal case.
-      await log(
+      log(
         "info",
         "collectProviderTasks",
         `${providerId} has no options.apiKey; querying ${baseURL} unauthenticated. ` +
@@ -172,12 +403,12 @@ async function collectProviderTasks(providers, settings, log) {
     const autoModelsFlag = opts.autoModels;
 
     if (autoModelsFlag === false) {
-      await log("info", "collectProviderTasks", `Skipping ${providerId}: options.autoModels is false`);
+      log("info", "collectProviderTasks", `Skipping ${providerId}: options.autoModels is false`);
       continue;
     }
 
     if (!isOpenAICompatible && autoModelsFlag !== true) {
-      await log(
+      log(
         "info",
         "collectProviderTasks",
         `Skipping ${providerId}: npm is ${JSON.stringify(provider.npm)}, not "@ai-sdk/openai-compatible". ` +
@@ -188,7 +419,7 @@ async function collectProviderTasks(providers, settings, log) {
 
     const existingModels = provider.models;
     if (existingModels && Object.keys(existingModels).length > 0 && autoModelsFlag !== true) {
-      await log(
+      log(
         "info",
         "collectProviderTasks",
         `Skipping ${providerId}: it already defines ${Object.keys(existingModels).length} model(s) manually. ` +
@@ -207,13 +438,21 @@ async function collectProviderTasks(providers, settings, log) {
 
     const limitRules = [...compileLimitRules(opts.modelLimits), ...settings.globalRules];
     const url = new URL("models", baseURL.endsWith("/") ? baseURL : `${baseURL}/`).toString();
+    const cacheTtlMs = typeof opts.autoModelsCacheTtl === "number" ? opts.autoModelsCacheTtl : settings.cacheTtlMs;
 
-    if (settings.dryRun) {
-      await log("info", "collectProviderTasks", `[dry-run] Would fetch models for ${providerId} from ${url}`);
-      continue;
-    }
-
-    tasks.push({ providerId, provider, url, apiKey, existingModels, includeFilter, excludeFilter, providerDefaults, limitRules });
+    tasks.push({
+      providerId,
+      provider,
+      url,
+      apiKey,
+      existingModels,
+      includeFilter,
+      excludeFilter,
+      providerDefaults,
+      limitRules,
+      cacheTtlMs,
+      cacheKey: cacheKeyFor(providerId, url, apiKey),
+    });
   }
 
   return tasks;
@@ -239,24 +478,132 @@ function buildModelMap(task, data) {
   return discovered;
 }
 
+async function fetchAndCache(task, settings) {
+  const data = await fetchModels(task.url, task.apiKey, settings.timeoutMs, settings.retries, settings.retryDelayMs);
+  // Only a successful response is written. Caching a failure as `[]` would make
+  // a transient outage sticky for a whole TTL and indistinguishable from a
+  // provider that genuinely serves no models.
+  try {
+    await settings.store.write(task.cacheKey, serializeEntry(task, data, settings.now()));
+  } catch {
+    // Writing is best effort: the cache is an optimisation and must never be
+    // able to fail a discovery that already succeeded.
+  }
+  return data;
+}
+
+/**
+ * Warm the cache for the NEXT start. Deliberately detached, and deliberately
+ * limited to the cache: by the time this resolves, opencode has already read
+ * `cfg.provider` and built its model catalog, so mutating the config here would
+ * advertise models the catalog does not contain.
+ *
+ * The per-settings guard matters because the `config` hook is not once per
+ * process — opencode re-runs it on every config reload, and without this a few
+ * edits to opencode.json would fan out a refresh per provider per edit.
+ */
+function scheduleRefresh(task, settings, log) {
+  if (settings.refreshed.has(task.cacheKey)) return;
+  settings.refreshed.add(task.cacheKey);
+
+  settings.background.push(
+    fetchAndCache(task, settings).then(
+      (data) =>
+        log(
+          "info",
+          "scheduleRefresh",
+          `Refreshed the cached model list for ${task.providerId} (${data.length} model(s)) for the next start`
+        ),
+      (e) => log("warn", "scheduleRefresh", `Background refresh failed for ${task.providerId}: ${errorDetail(e)}`)
+    )
+  );
+}
+
+/**
+ * Stale-while-revalidate, per provider:
+ *   fresh  -> serve from disk, no blocking network, refresh in the background
+ *   stale  -> fetch; on failure fall back to the stale copy rather than leaving
+ *             the provider empty when a usable answer is already on disk
+ *   miss   -> fetch (exactly today's behavior)
+ */
+/** Reading is best effort too, so an injected or broken store cannot fail discovery. */
+async function readCached(task, settings) {
+  if (!settings.cache || settings.refresh) return null;
+  try {
+    return readEntry(await settings.store.read(task.cacheKey), task, settings.now());
+  } catch {
+    return null;
+  }
+}
+
+/** `age` is Infinity for a future-dated entry, which must not reach a log line. */
+function describeAge(age) {
+  return Number.isFinite(age) ? `${Math.round(age / 1000)}s old` : "dated in the future";
+}
+
+async function resolveTaskData(task, settings, log) {
+  const entry = await readCached(task, settings);
+
+  if (entry && entry.age <= task.cacheTtlMs) {
+    log(
+      "info",
+      "resolveTaskData",
+      `Serving ${task.providerId} from the cached model list (${task.cacheKey}, ${entry.data.length} model(s), ` +
+        `${describeAge(entry.age)}); refreshing in the background for the next start`
+    );
+    scheduleRefresh(task, settings, log);
+    return entry.data;
+  }
+
+  if (!entry) return fetchAndCache(task, settings);
+
+  try {
+    return await fetchAndCache(task, settings);
+  } catch (e) {
+    log(
+      "warn",
+      "resolveTaskData",
+      `Refresh failed for ${task.providerId}; falling back to the expired cached list ` +
+        `(${entry.data.length} model(s), ${describeAge(entry.age)}): ${errorDetail(e)}`
+    );
+    return entry.data;
+  }
+}
+
 /**
  * Fetch every eligible provider in parallel and return the discovered model maps.
  * Runtime-agnostic on purpose: callers decide how to apply the result, so the
  * same core serves the v1 `config` hook and any future v2 registration path.
  */
 async function discoverAll(providers, settings, log) {
-  const tasks = await collectProviderTasks(providers, settings, log);
+  const tasks = collectProviderTasks(providers, settings, log);
 
   if (tasks.length === 0) {
-    await log("info", "discoverAll", "No eligible providers for auto-discovery");
+    log("info", "discoverAll", "No eligible providers for auto-discovery");
     return [];
   }
 
-  await log("info", "discoverAll", `Discovering models for ${tasks.length} provider(s): ${tasks.map((t) => t.providerId).join(", ")}`);
+  if (settings.dryRun) {
+    for (const task of tasks) {
+      const entry = await readCached(task, settings);
 
-  const results = await Promise.allSettled(
-    tasks.map((t) => fetchModels(t.url, t.apiKey, settings.timeoutMs, settings.retries, settings.retryDelayMs))
-  );
+      if (entry && entry.age <= task.cacheTtlMs) {
+        log(
+          "info",
+          "discoverAll",
+          `[dry-run] Would serve ${task.providerId} from the cached model list ` +
+            `(${entry.data.length} model(s), ${describeAge(entry.age)}) and refresh it in the background`
+        );
+      } else {
+        log("info", "discoverAll", `[dry-run] Would fetch models for ${task.providerId} from ${task.url}`);
+      }
+    }
+    return [];
+  }
+
+  log("info", "discoverAll", `Discovering models for ${tasks.length} provider(s): ${tasks.map((t) => t.providerId).join(", ")}`);
+
+  const results = await Promise.allSettled(tasks.map((t) => resolveTaskData(t, settings, log)));
 
   const discoveries = [];
 
@@ -268,14 +615,14 @@ async function discoverAll(providers, settings, log) {
     const task = tasks[i];
 
     if (result.status === "rejected") {
-      await log("error", "discoverAll", `Discovery failed for ${task.providerId} at ${task.url}: ${errorDetail(result.reason)}`);
+      log("error", "discoverAll", `Discovery failed for ${task.providerId} at ${task.url}: ${errorDetail(result.reason)}`);
       continue;
     }
 
     const discovered = buildModelMap(task, result.value);
 
     if (Object.keys(discovered).length === 0) {
-      await log("warn", "discoverAll", `No models discovered for ${task.providerId} at ${task.url}`);
+      log("warn", "discoverAll", `No models discovered for ${task.providerId} at ${task.url}`);
       continue;
     }
 
@@ -296,7 +643,17 @@ function mergeWithManual(discovered, existingModels) {
   return merged;
 }
 
-function resolveSettings(options) {
+function resolveSettings(options, log) {
+  const env = readEnv();
+  const sep = readPlatform() === "win32" ? "\\" : "/";
+
+  // `cache: false` must not merely skip reads: an injected store would still be
+  // written through, so disabling the cache swaps the store out entirely.
+  const cacheEnabled = options?.cache !== false;
+  const dir = cacheEnabled ? resolveCacheDir(options, env, sep) : null;
+  const store = cacheEnabled ? options?.cacheStore ?? (dir ? createFsStore(dir, sep, log) : createNullStore()) : createNullStore();
+  const cache = cacheEnabled && (!!options?.cacheStore || !!dir);
+
   return {
     dryRun: options?.dryRun === true,
     timeoutMs: typeof options?.timeout === "number" ? options.timeout : DEFAULT_TIMEOUT_MS,
@@ -307,14 +664,31 @@ function resolveSettings(options) {
       output: typeof options?.defaultOutput === "number" ? options.defaultOutput : DEFAULT_LIMITS.output,
     },
     globalRules: compileLimitRules(options?.modelLimits),
+    cache,
+    cacheTtlMs: typeof options?.cacheTtl === "number" ? options.cacheTtl : DEFAULT_CACHE_TTL_MS,
+    refresh: options?.refresh === true || env.OPENCODE_AUTO_MODELS_REFRESH === "1",
+    store,
+    now: typeof options?.now === "function" ? options.now : Date.now,
+    // Scoped per plugin instance rather than module-wide, so a config reload
+    // reuses the guard while a fresh instance starts clean.
+    refreshed: new Set(),
+    background: [],
   };
+}
+
+/** Awaits every detached refresh and drains the log queue. Used by tests. */
+async function settleBackground(settings, log) {
+  while (settings.background.length > 0) {
+    await Promise.allSettled(settings.background.splice(0));
+  }
+  await log.idle();
 }
 
 // ─── v1 entrypoint ──────────────────────────────────────────────────────────
 
 function createV1Hooks({ client }, options) {
   const log = createLogger(client);
-  const settings = resolveSettings(options);
+  const settings = resolveSettings(options, log);
 
   return {
     log,
@@ -322,20 +696,26 @@ function createV1Hooks({ client }, options) {
       config: async (config) => {
         try {
           const providers = config.provider ?? {};
-          await log("info", "config", `Config hook running over ${Object.keys(providers).length} provider(s)`);
+          log("info", "config", `Config hook running over ${Object.keys(providers).length} provider(s)`);
 
           const discoveries = await discoverAll(providers, settings, log);
 
           for (const { task, discovered } of discoveries) {
             task.provider.models = mergeWithManual(discovered, task.existingModels);
-            await log("info", "config", `Discovered ${Object.keys(discovered).length} model(s) for ${task.providerId}`, {
+            log("info", "config", `Discovered ${Object.keys(discovered).length} model(s) for ${task.providerId}`, {
               models: Object.keys(discovered),
             });
           }
         } catch (e) {
-          await log("error", "config", `Config hook failed: ${errorDetail(e)}`);
+          log("error", "config", `Config hook failed: ${errorDetail(e)}`);
         }
       },
+
+      // Not opencode hooks: opencode dispatches by known hook name, so these are
+      // inert there. They exist so the test suite can await work that is
+      // deliberately detached from the startup path.
+      flushLogs: () => log.idle(),
+      settle: () => settleBackground(settings, log),
     },
   };
 }
@@ -408,7 +788,7 @@ async function loadDiscoveries(ctx, settings, log) {
     if (!id) continue;
 
     if (!readProviderSettings(record)) {
-      await log("warn", "setup", `Cannot read connection settings for provider ${id}; skipping it`);
+      log("warn", "setup", `Cannot read connection settings for provider ${id}; skipping it`);
       continue;
     }
     providers[id] = asDiscoveryProvider(record);
@@ -437,12 +817,12 @@ async function runV2Discovery(ctx) {
   if (!isV2Context(ctx)) return;
 
   const log = createLogger(ctx?.client ?? { app: { log: async () => {} } });
-  const settings = resolveSettings(ctx?.options);
+  const settings = resolveSettings(ctx?.options, log);
 
-  await log("info", "setup", "Loaded (v2 entrypoint)");
+  log("info", "setup", "Loaded (v2 entrypoint)");
 
   if (typeof ctx.provider.transform !== "function") {
-    await log("error", "setup", "ctx.provider exists but has no transform(); cannot auto-discover models on this runtime");
+    log("error", "setup", "ctx.provider exists but has no transform(); cannot auto-discover models on this runtime");
     return;
   }
 
@@ -453,7 +833,7 @@ async function runV2Discovery(ctx) {
   try {
     source.discoveries = await loadDiscoveries(ctx, settings, log);
   } catch (e) {
-    await log("error", "setup", `Discovery failed: ${errorDetail(e)}`);
+    log("error", "setup", `Discovery failed: ${errorDetail(e)}`);
     return;
   }
 
@@ -473,12 +853,12 @@ async function runV2Discovery(ctx) {
     });
 
     for (const { task, discovered } of source.discoveries) {
-      await log("info", "setup", `Discovered ${Object.keys(discovered).length} model(s) for ${task.providerId}`, {
+      log("info", "setup", `Discovered ${Object.keys(discovered).length} model(s) for ${task.providerId}`, {
         models: Object.keys(discovered),
       });
     }
   } catch (e) {
-    await log("error", "setup", `Provider transform failed: ${errorDetail(e)}`);
+    log("error", "setup", `Provider transform failed: ${errorDetail(e)}`);
   }
 }
 
@@ -505,7 +885,7 @@ export default {
     const { log, hooks } = createV1Hooks(input, options);
     // If this line is absent from the log, the plugin was never loaded at all —
     // the single most useful signal when diagnosing a GUI front-end.
-    await log("info", "server", "Loaded (v1 entrypoint)");
+    log("info", "server", "Loaded (v1 entrypoint)");
     return hooks;
   },
 };

@@ -14,15 +14,19 @@ models from OpenAI-compatible providers, so you don't have to maintain a manual
 - **Universal**: works with any provider that uses the
   [`@ai-sdk/openai-compatible`](https://www.npmjs.com/package/@ai-sdk/openai-compatible)
   driver, or any provider explicitly opted in with `autoModels: true`.
-- **Dependency-free plain JavaScript**: a single file with no imports and no
-  build step, so it loads anywhere opencode runs, including the Windows desktop
-  app.
+- **Near-instant startup**: each provider's model list is cached on disk and
+  refreshed in the background, so after the first run opencode starts without
+  waiting on a single network request.
+- **Dependency-free plain JavaScript**: a single file with no third-party
+  dependencies and no build step, so it loads anywhere opencode runs, including
+  the Windows desktop app. Its only import is an optional, guarded
+  `node:fs/promises` for the cache; without it the plugin simply runs uncached.
 - **Runs on opencode v1 and v2**: one file serves both plugin contracts.
 - **Loud about failures**: every provider it skips, and every reason, is logged.
   A plugin that quietly does nothing is indistinguishable from one that is not
   installed, which is the failure mode this is built to avoid.
-- **Safe defaults**: requests time out and are retried once, so a slow provider
-  cannot hang opencode startup, and one failing provider cannot affect another.
+- **Safe defaults**: requests time out and are retried once, and one failing
+  provider cannot affect another.
 
 ## Requirements
 
@@ -175,6 +179,7 @@ Set these inside `provider.options`:
 | `autoModelsOutput` | `16384` | Default output limit for every auto-discovered model of this provider. |
 | `autoModelsInclude` | — | Case-insensitive regex; only matching model IDs are kept. |
 | `autoModelsExclude` | — | Case-insensitive regex; matching model IDs are dropped. |
+| `autoModelsCacheTtl` | inherits `cacheTtl` | Cache lifetime in milliseconds for this provider only. |
 | `modelLimits` | — | Per-provider regex-based model limits (see [Model context limits](#model-context-limits)). |
 
 Both `baseURL` and `apiKey` must be present in the config for a provider to be
@@ -207,6 +212,59 @@ If you load the plugin via the `plugin` array, you can pass options:
 | `defaultContext` | `128000` | Fallback context limit for auto-discovered models. |
 | `defaultOutput` | `16384` | Fallback output limit for auto-discovered models. |
 | `modelLimits` | — | Global regex-based model limits (see below). |
+| `cache` | `true` | Cache each provider's model list on disk (see [Startup cost](#startup-cost)). |
+| `cacheTtl` | `86400000` | Cache lifetime in milliseconds, 24 hours by default. |
+| `cacheDir` | auto | Override the cache directory. |
+| `refresh` | `false` | Ignore cached entries for this run and refetch everything. |
+
+## Startup cost
+
+opencode awaits the plugin before it builds its model catalog, so without a
+cache every start waits for a `GET /models` round trip to every provider. The
+plugin cannot simply move that work into the background: opencode reads the
+provider config as soon as the hook returns, so a hook that returns early yields
+a catalog with no models at all, and there is no way to rebuild it afterwards.
+
+What it does instead is take the *network* off the startup path rather than the
+wait. Each provider's raw `/models` response is cached on disk. A start that
+finds a usable entry applies it immediately and issues no request at all,
+refreshing the list in the background for the next start. Only a first run, a
+newly added provider, or an entry older than `cacheTtl` fetches before startup
+continues, and an expired entry whose refetch fails is still used rather than
+leaving you with no models.
+
+The raw response is what gets cached, not the processed model list, so editing
+`autoModelsInclude`, `autoModelsExclude`, `modelLimits` or the context defaults
+takes effect on the very next start with no refetch and no cache clearing.
+
+A provider whose model list changes often, such as a local Ollama or llama.cpp
+server, can shorten its own lifetime with `autoModelsCacheTtl` in
+`provider.options` without affecting the others.
+
+### Clearing the cache
+
+Entries live under opencode's own cache root, so deleting that directory is the
+universal reset:
+
+```bash
+# macOS / Linux / WSL
+rm -rf ~/.cache/opencode/auto-models
+
+# Windows (PowerShell) — including the Windows desktop app
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\opencode\auto-models"
+```
+
+A WSL install and a Windows install keep separate cache trees on separate
+filesystems, exactly as they do for config and plugins, so clearing one does not
+touch the other. From WSL, the Windows copy is at
+`/mnt/c/Users/<You>/.cache/opencode/auto-models`.
+
+To refetch once without deleting anything, set `refresh: true` in the plugin
+options or run opencode with `OPENCODE_AUTO_MODELS_REFRESH=1`. To disable the
+cache entirely, set `cache: false`.
+
+The cache holds each provider's `/models` URL and the model list it returned. It
+never holds API keys, and it is written with owner-only permissions.
 
 ## How it works
 
@@ -289,13 +347,18 @@ written both through opencode's logger and to stdout/stderr.
   (`%USERPROFILE%\.local\share\opencode\log` on Windows), or use
   **Help → Export logs**, which zips the desktop and server logs together.
 
-Start by searching for `[auto-models:AutoModelsPlugin] Loaded`. If that line is
-absent, the plugin was never loaded and the problem is installation, not
-discovery: check that the `plugin` entry is in the config opencode is actually
-reading, and prefer the file-copy install in Option 1.
+Start by searching for `[auto-models:server] Loaded` (or `[auto-models:setup]
+Loaded` on v2). If that line is absent, the plugin was never loaded and the
+problem is installation, not discovery: check that the `plugin` entry is in the
+config opencode is actually reading, and prefer the file-copy install in
+Option 1.
 
 If it is present, the following lines name every provider that was skipped and
 why.
+
+Lines from `resolveTaskData` say whether a provider was served from cache or
+fetched. If a model you just added upstream is missing, the cached list is one
+start behind; see [Clearing the cache](#clearing-the-cache).
 
 ## Testing
 
@@ -305,7 +368,13 @@ node test/run.mjs
 
 Requires Node, which is a development-time dependency only. No packages to
 install and no opencode install required; the suite stubs the opencode client,
-the v2 provider domain, and `fetch`.
+the v2 provider domain, and `fetch`. The cache is exercised both through an
+in-memory store and against a real temporary directory, and the suite fails if
+any background promise is left unhandled.
+
+`npm run typecheck` runs `tsc --noEmit` over `src/`. Both run on every push and
+pull request via GitHub Actions, across Node 20 and 22 on Linux, macOS and
+Windows.
 
 ## License
 
