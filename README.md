@@ -26,7 +26,10 @@ models from OpenAI-compatible providers, so you don't have to maintain a manual
 
 ## Requirements
 
-opencode **1.18.29 or newer**, or opencode v2.
+opencode **1.18.29 or newer**, or opencode v2. Nothing else: no Node, no Bun,
+no package manager and no build step are needed to run the plugin, because
+opencode loads it with its own embedded runtime. (Node is only needed to run
+the test suite.)
 
 The plugin ships a single object entrypoint that both runtimes understand: v1
 calls its `server()` and v2 calls its `setup()`. Object entrypoints landed in
@@ -275,8 +278,9 @@ why.
 node test/run.mjs
 ```
 
-No dependencies and no opencode install required; the suite stubs the opencode
-client and `fetch`.
+Requires Node, which is a development-time dependency only. No packages to
+install and no opencode install required; the suite stubs the opencode client,
+the v2 provider domain, and `fetch`.
 
 ## License
 
