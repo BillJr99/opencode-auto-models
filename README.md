@@ -28,7 +28,7 @@ Add the plugin to your OpenCode config:
 ```json
 {
   "plugin": [
-    "git+https://github.com/vitkuz573/opencode-auto-models.git"
+    "git+https://github.com/BillJr99/opencode-auto-models.git"
   ]
 }
 ```
@@ -129,7 +129,7 @@ If you load the plugin via the `plugin` array, you can pass options:
 ```json
 {
   "plugin": [
-    ["git+https://github.com/vitkuz573/opencode-auto-models.git", {
+    ["git+https://github.com/BillJr99/opencode-auto-models.git", {
       "timeout": 10000,
       "cacheTtl": 600000,
       "modelLimits": [
