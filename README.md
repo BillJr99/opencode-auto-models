@@ -114,6 +114,27 @@ but never runs, prefer Option 1 or 2 and check
 `~/.cache/opencode/packages/` to see whether the install actually produced
 anything.
 
+### Forcing a reinstall
+
+opencode unpacks git and npm plugin installs into a package cache and reuses
+what it finds there, so a half-finished install, or a version you have since
+changed, can persist across restarts. Deleting the package cache makes opencode
+install from scratch on the next start:
+
+```bash
+# macOS / Linux / WSL
+rm -rf ~/.cache/opencode/packages
+
+# Windows (PowerShell)
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\opencode\packages"
+```
+
+This is the *package* cache, holding the plugin code itself. It is separate from
+the model-list cache this plugin keeps under `auto-models/`, which is cleared
+independently; see [Clearing the cache](#clearing-the-cache). Clearing one does
+not clear the other, and as noted there, WSL and Windows keep separate trees, so
+clearing one of those does not touch the other either.
+
 ## Usage
 
 Define a provider that uses the OpenAI-compatible driver and leave the `models`
@@ -265,6 +286,11 @@ cache entirely, set `cache: false`.
 
 The cache holds each provider's `/models` URL and the model list it returned. It
 never holds API keys, and it is written with owner-only permissions.
+
+This is the *model-list* cache only. The plugin code itself lives in opencode's
+package cache alongside it; if you are trying to make opencode pick up a
+reinstalled or updated plugin rather than a refreshed model list, see
+[Forcing a reinstall](#forcing-a-reinstall).
 
 ## How it works
 
