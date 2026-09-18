@@ -38,7 +38,18 @@ with `opencode --version` and update if needed.
 
 ## Installation
 
-### Option 1 — Copy the file (recommended, works everywhere)
+### Option 1 — From npm
+
+```json
+{
+  "plugin": ["@billjr99/opencode-auto-models"]
+}
+```
+
+On opencode v2 the key is `plugins`. To pin a version, append it:
+`@billjr99/opencode-auto-models@0.2.0`.
+
+### Option 2 — Copy the file (works everywhere, no resolution step)
 
 The plugin is one dependency-free JavaScript file. Copying it needs no package
 manager, no `git`, and no TypeScript loader:
@@ -84,7 +95,7 @@ On opencode v2 the key is `plugins` and entries take an object form:
 opencode resolves this by installing the package at startup, which requires a
 working `git` binary in the environment opencode itself runs in. That is not
 always the environment your shell has, so if the plugin appears in your config
-but never runs, prefer Option 1 and check
+but never runs, prefer Option 1 or 2 and check
 `~/.cache/opencode/packages/` to see whether the install actually produced
 anything.
 

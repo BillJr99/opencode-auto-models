@@ -1,6 +1,6 @@
 {
-  "name": "opencode-auto-models",
-  "version": "0.1.0",
+  "name": "@billjr99/opencode-auto-models",
+  "version": "0.2.0",
   "description": "OpenCode plugin that auto-discovers models from OpenAI-compatible providers",
   "type": "module",
   "main": "src/index.js",
@@ -24,7 +24,13 @@
     "url": "git+https://github.com/BillJr99/opencode-auto-models.git"
   },
   "author": "Vitaly Kuzyaev <vitkuz573@gmail.com>",
+  "contributors": [
+    "William Mongan (https://github.com/BillJr99)"
+  ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "opencode",
     "plugin",
