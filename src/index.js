@@ -720,91 +720,31 @@ function createV1Hooks({ client }, options) {
   };
 }
 
-// ─── v2 entrypoint ──────────────────────────────────────────
+// ─── Entrypoint ──────────────────────────────────────────────
 
 /**
- * v2 replaced the mutable global config object with domain objects on the
- * plugin context, and a provider inventory is edited through
- * `ctx.catalog.transform`.
+ * opencode v1 only. Its loader reads `server` from the module and calls it;
+ * `PluginModule` is `{ id?, server, tui? }` and the loader never looks for
+ * anything else.
  *
- * Auto-discovery cannot be expressed there yet. `CatalogDraft` offers
- * `provider.list/get/update/remove` and `model.get/update/remove` alongside
- * `model.default`, and nothing anywhere that adds a provider or a model;
- * `ProviderV2Info` carries no model collection either, so editing a provider is
- * not a way in. This plugin exists to add models the user has not listed, so v2
- * currently gives it nothing to add them with. Checked against
- * `@opencode-ai/plugin` on both the `beta` and `dev` tags and against
- * `@opencode-ai/sdk`'s v2 types.
- *
- * What used to be here called `editor.models.set()` on a `ctx.provider` domain.
- * Neither has ever existed in a published build, so on every real v2 runtime
- * `setup()` failed its own context check and returned without a word. A plugin
- * that silently does nothing is the exact failure mode this file is built to
- * avoid, so it now reports the limitation instead of appearing to work.
- */
-
-/**
- * A v2 context exposes domain objects, and `catalog` is where providers and
- * models live. A v1 plugin input has no domains at all, carrying `client`,
- * `project`, `directory`, `worktree` and `$` instead.
- *
- * This matters because a v1 runtime calls `server()` and then also calls
- * `setup()` on the same entrypoint object. Discovery has already happened by
- * then, so `setup()` must recognise the v1 input and return without doing or
- * reporting anything.
- */
-function isV2Context(ctx) {
-  return !!ctx && typeof ctx.catalog === "object" && ctx.catalog !== null;
-}
-
-async function runV2Discovery(ctx) {
-  if (!isV2Context(ctx)) return;
-
-  // v2 contexts carry no `client`; the console mirror in createLogger is what
-  // actually surfaces these lines there.
-  const log = createLogger(ctx?.client ?? { app: { log: async () => {} } });
-
-  log("info", "setup", "Loaded (v2 entrypoint)");
-
-  if (typeof ctx.catalog.transform !== "function") {
-    log(
-      "error",
-      "setup",
-      "ctx.catalog exists but has no transform(); this runtime is not one this plugin recognises."
-    );
-    return;
-  }
-
-  log(
-    "warn",
-    "setup",
-    "Auto-discovery is not available on opencode v2. Its catalog API can update, remove and " +
-      "re-default models that already exist, but neither ctx.catalog.transform nor the v2 SDK can " +
-      "add one, and adding models you have not listed is the whole of what this plugin does. " +
-      "Until v2 grows a way to add them, list the models you need under provider.<id>.models in " +
-      "your config, or run the plugin on opencode v1, where the config hook still works."
-  );
-}
-
-// ─── Entrypoint ─────────────────────────────────────────────────────────────
-
-/**
- * One default export serving both runtimes, per opencode's v1-to-v2 migration
- * guide: v1 calls `server()` and ignores `setup()`, v2 does the reverse.
+ * There is deliberately no v2 entrypoint. v2 replaced the config object with
+ * domain objects and edits the inventory through `ctx.catalog.transform`, whose
+ * draft can update, remove and re-default models but cannot add one, and
+ * nothing else in the v2 context or SDK can either. Adding models you have not
+ * listed is the whole of what this plugin does, so there is nothing to build on
+ * yet, and v2 is still in beta. If it grows a way to add catalog entries, the
+ * discovery core here is runtime-agnostic and only needs a new apply step.
  *
  * Object entrypoints require opencode 1.18.29 or newer. This is the module's
  * only export on purpose: the v1 loader iterates every export, so a second one
  * would register the hook twice and fetch every provider twice per config load.
  *
- * `id` and `setup` are declared literally rather than through
- * `Plugin.define()` so the plugin keeps zero dependencies and can be dropped
- * into a plugins directory as a single file.
+ * `id` is declared literally rather than through `Plugin.define()` so the
+ * plugin keeps zero dependencies and can be dropped into a plugins directory as
+ * a single file.
  */
 export default {
   id: "auto-models",
-  async setup(ctx) {
-    await runV2Discovery(ctx);
-  },
   async server(input, options) {
     const { log, hooks } = createV1Hooks(input, options);
     // If this line is absent from the log, the plugin was never loaded at all —

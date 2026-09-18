@@ -21,9 +21,7 @@ models from OpenAI-compatible providers, so you don't have to maintain a manual
   dependencies and no build step, so it loads anywhere opencode runs, including
   the Windows desktop app. Its only import is an optional, guarded
   `node:fs/promises` for the cache; without it the plugin simply runs uncached.
-- **opencode v1 today**: one file carries both plugin entrypoints, but
-  discovery itself only works on v1. See
-  [opencode v2](#opencode-v2-is-not-supported-yet).
+- **Built for opencode v1**: see [Requirements](#requirements).
 - **Loud about failures**: every provider it skips, and every reason, is logged.
   A plugin that quietly does nothing is indistinguishable from one that is not
   installed, which is the failure mode this is built to avoid.
@@ -37,14 +35,14 @@ no package manager and no build step are needed to run the plugin, because
 opencode loads it with its own embedded runtime. (Node is only needed to run
 the test suite.)
 
-The plugin ships a single object entrypoint that both runtimes understand: v1
-calls its `server()` and v2 calls its `setup()`. Object entrypoints landed in
-opencode 1.18.29, so on an older v1 build the plugin is not recognised. Check
-with `opencode --version` and update if needed.
+The plugin ships a single object entrypoint, `{ id, server }`, which is what
+v1's loader reads. Object entrypoints landed in opencode 1.18.29, so on an
+older build the plugin is not recognised. Check with `opencode --version` and
+update if needed.
 
-On opencode v2 the plugin loads and reports that it cannot run; discovery is a
-v1 feature for now, for the reason in
-[opencode v2](#opencode-v2-is-not-supported-yet).
+opencode v2 is not supported. It is still in beta, and its catalog API has no
+way to add a model, which is the only thing this plugin does; see
+[How it works](#how-it-works).
 
 ## Installation
 
@@ -58,23 +56,11 @@ v1 feature for now, for the reason in
 }
 ```
 
-On opencode v2 the key is `plugins` and entries take an object form:
-
-```json
-{
-  "plugins": [
-    { "package": "git+https://github.com/BillJr99/opencode-auto-models.git" }
-  ]
-}
-```
-
 opencode resolves this by installing the package at startup, which requires a
 working `git` binary in the environment opencode itself runs in. That is not
 always the environment your shell has, so if the plugin appears in your config
 but never runs, use Option 2 and check `~/.cache/opencode/packages/` to see
 whether the install actually produced anything.
-
-This plugin is not published to npm; install it from git or copy the file.
 
 ### Forcing a reinstall
 
@@ -311,31 +297,18 @@ are unaffected.
 Every provider that is *not* eligible is logged with the specific reason, so an
 empty model list is always explainable.
 
-### opencode v2 is not supported yet
+### opencode v2
 
-The plugin loads on v2 and tells you it cannot run, rather than failing quietly.
+Not supported, and nothing in this plugin tries to be.
 
-v2 removed the mutable global config object and the `config` hook with it.
-Providers and models are edited through `ctx.catalog.transform(draft => ...)`,
-and that draft offers `provider.list`, `provider.get`, `provider.update`,
-`provider.remove`, `model.get`, `model.update`, `model.remove` and
-`model.default`. There is no way to **add** a provider or a model, in the draft
-or anywhere else in the v2 SDK, and `ProviderV2Info` carries no model
-collection, so editing a provider is not a way round it.
+v2 is still in beta, and it replaced the config object with domain objects: the
+inventory is edited through `ctx.catalog.transform`, whose draft can update,
+remove and re-default models but cannot **add** one, and nothing else in the v2
+context or SDK can either. Discovering models you have not listed is the whole
+of what this plugin does, so there is nothing there to build on yet.
 
-Adding models you have not listed is the whole of what this plugin does, so on
-v2 there is currently nothing to add them with. This was checked against
-`@opencode-ai/plugin` on both the `beta` and `dev` tags and against
-`@opencode-ai/sdk`'s v2 types.
-
-Until v2 grows a way to add catalog entries, either list the models you need
-under `provider.<id>.models` in your config, or run the plugin on opencode v1,
-where the `config` hook still works.
-
-Earlier releases of this plugin appeared to support v2. They detected it by a
-`ctx.provider` domain and applied models with `editor.models.set()`; neither has
-existed in any published opencode build, so `setup()` failed its own context
-check and returned silently on every real v2 runtime. That code is gone.
+If v2 grows a way to add catalog entries, the discovery core here is
+runtime-agnostic and needs only a new apply step.
 
 ## Model context limits
 
@@ -382,8 +355,7 @@ written both through opencode's logger and to stdout/stderr.
   (`%USERPROFILE%\.local\share\opencode\log` on Windows), or use
   **Help → Export logs**, which zips the desktop and server logs together.
 
-Start by searching for `[auto-models:server] Loaded` (or `[auto-models:setup]
-Loaded` on v2). If that line is absent, the plugin was never loaded and the
+Start by searching for `[auto-models:server] Loaded`. If that line is absent, the plugin was never loaded and the
 problem is installation, not discovery: check that the `plugin` entry is in the
 config opencode is actually reading, and prefer the file-copy install in
 Option 2.
@@ -402,8 +374,8 @@ node test/run.mjs
 ```
 
 Requires Node, which is a development-time dependency only. No packages to
-install and no opencode install required; the suite stubs the opencode client,
-a v2 plugin context, and `fetch`. The cache is exercised both through an
+install and no opencode install required; the suite stubs the opencode client
+and `fetch`. The cache is exercised both through an
 in-memory store and against a real temporary directory, and the suite fails if
 any background promise is left unhandled or if any test writes to a real cache
 directory.
