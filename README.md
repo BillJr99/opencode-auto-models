@@ -57,14 +57,25 @@ manager, no `git`, and no TypeScript loader:
 ```bash
 # Global, macOS/Linux
 mkdir -p ~/.config/opencode/plugins
-cp src/index.js ~/.config/opencode/plugins/auto-models.js
+cp src/index.js ~/.config/opencode/plugins/auto-models.mjs
 
 # Project-local
 mkdir -p .opencode/plugins
-cp src/index.js .opencode/plugins/auto-models.js
+cp src/index.js .opencode/plugins/auto-models.mjs
 ```
 
-On Windows, copy it to `C:\Users\<You>\.config\opencode\plugins\auto-models.js`.
+On Windows, copy it to
+`C:\Users\<You>\.config\opencode\plugins\auto-models.mjs`. From WSL that is
+`/mnt/c/Users/<You>/.config/opencode/plugins/auto-models.mjs`, which is the
+easiest way to get the file across.
+
+Use the `.mjs` extension rather than `.js`. A plugins directory has no
+`package.json`, so Node cannot tell whether a loose `.js` file is ESM or
+CommonJS: it attempts CommonJS, fails, warns
+`MODULE_TYPELESS_PACKAGE_JSON`, and falls back to ESM. The module loads
+either way, but `.mjs` declares ESM outright and avoids relying on that
+fallback. Inside the npm package the question does not arise, because
+`package.json` sets `"type": "module"`.
 
 Files in these directories are loaded automatically at startup.
 
