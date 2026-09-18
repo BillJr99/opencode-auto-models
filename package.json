@@ -28,9 +28,6 @@
     "William Mongan (https://github.com/BillJr99)"
   ],
   "license": "MIT",
-  "publishConfig": {
-    "access": "public"
-  },
   "keywords": [
     "opencode",
     "plugin",

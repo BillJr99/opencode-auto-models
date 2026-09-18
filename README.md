@@ -21,7 +21,9 @@ models from OpenAI-compatible providers, so you don't have to maintain a manual
   dependencies and no build step, so it loads anywhere opencode runs, including
   the Windows desktop app. Its only import is an optional, guarded
   `node:fs/promises` for the cache; without it the plugin simply runs uncached.
-- **Runs on opencode v1 and v2**: one file serves both plugin contracts.
+- **opencode v1 today**: one file carries both plugin entrypoints, but
+  discovery itself only works on v1. See
+  [opencode v2](#opencode-v2-is-not-supported-yet).
 - **Loud about failures**: every provider it skips, and every reason, is logged.
   A plugin that quietly does nothing is indistinguishable from one that is not
   installed, which is the failure mode this is built to avoid.
@@ -30,7 +32,7 @@ models from OpenAI-compatible providers, so you don't have to maintain a manual
 
 ## Requirements
 
-opencode **1.18.29 or newer**, or opencode v2. Nothing else: no Node, no Bun,
+opencode **1.18.29 or newer**, on the v1 line. Nothing else: no Node, no Bun,
 no package manager and no build step are needed to run the plugin, because
 opencode loads it with its own embedded runtime. (Node is only needed to run
 the test suite.)
@@ -39,6 +41,10 @@ The plugin ships a single object entrypoint that both runtimes understand: v1
 calls its `server()` and v2 calls its `setup()`. Object entrypoints landed in
 opencode 1.18.29, so on an older v1 build the plugin is not recognised. Check
 with `opencode --version` and update if needed.
+
+On opencode v2 the plugin loads and reports that it cannot run; discovery is a
+v1 feature for now, for the reason in
+[opencode v2](#opencode-v2-is-not-supported-yet).
 
 ## Installation
 
@@ -274,6 +280,11 @@ To refetch once without deleting anything, set `refresh: true` in the plugin
 options or run opencode with `OPENCODE_AUTO_MODELS_REFRESH=1`. To disable the
 cache entirely, set `cache: false`.
 
+The directory is resolved in this order: the `cacheDir` plugin option,
+`OPENCODE_AUTO_MODELS_CACHE_DIR`, `$XDG_CACHE_HOME/opencode/auto-models`, then
+the per-platform default shown above. If none of them resolve, the plugin runs
+uncached rather than failing.
+
 The cache holds each provider's `/models` URL and the model list it returned. It
 never holds API keys, and it is written with owner-only permissions.
 
@@ -300,23 +311,31 @@ are unaffected.
 Every provider that is *not* eligible is logged with the specific reason, so an
 empty model list is always explainable.
 
-### On opencode v2
+### opencode v2 is not supported yet
 
-v2 removed the mutable global config object and the `config` hook with it, so
-discovery runs from `setup()` instead and applies its results through
-`ctx.provider.transform(editor => editor.models.set(...))`. Eligibility,
-filtering and limit rules are shared with the v1 path.
+The plugin loads on v2 and tells you it cannot run, rather than failing quietly.
 
-Two v2 constraints shape the implementation. Transform callbacks must be
-synchronous and are replayed on every rebuild, so all network work happens
-before the callback and only the assignment happens inside it. And v2 models are
-`Model.Info` records with a fixed shape, so what v1 carries as `modalities`
-becomes `capabilities` here, alongside the required bookkeeping fields.
+v2 removed the mutable global config object and the `config` hook with it.
+Providers and models are edited through `ctx.catalog.transform(draft => ...)`,
+and that draft offers `provider.list`, `provider.get`, `provider.update`,
+`provider.remove`, `model.get`, `model.update`, `model.remove` and
+`model.default`. There is no way to **add** a provider or a model, in the draft
+or anywhere else in the v2 SDK, and `ProviderV2Info` carries no model
+collection, so editing a provider is not a way round it.
 
-The v1 path is tested against a stubbed client and the v2 path against a stubbed
-provider domain. Neither has been exercised against a live v2 runtime, so if a
-record shape is rejected the plugin reports it by name rather than leaving you
-with an empty provider and no explanation.
+Adding models you have not listed is the whole of what this plugin does, so on
+v2 there is currently nothing to add them with. This was checked against
+`@opencode-ai/plugin` on both the `beta` and `dev` tags and against
+`@opencode-ai/sdk`'s v2 types.
+
+Until v2 grows a way to add catalog entries, either list the models you need
+under `provider.<id>.models` in your config, or run the plugin on opencode v1,
+where the `config` hook still works.
+
+Earlier releases of this plugin appeared to support v2. They detected it by a
+`ctx.provider` domain and applied models with `editor.models.set()`; neither has
+existed in any published opencode build, so `setup()` failed its own context
+check and returned silently on every real v2 runtime. That code is gone.
 
 ## Model context limits
 
@@ -384,9 +403,10 @@ node test/run.mjs
 
 Requires Node, which is a development-time dependency only. No packages to
 install and no opencode install required; the suite stubs the opencode client,
-the v2 provider domain, and `fetch`. The cache is exercised both through an
+a v2 plugin context, and `fetch`. The cache is exercised both through an
 in-memory store and against a real temporary directory, and the suite fails if
-any background promise is left unhandled.
+any background promise is left unhandled or if any test writes to a real cache
+directory.
 
 `npm run typecheck` runs `tsc --noEmit` over `src/`. Both run on every push and
 pull request via GitHub Actions, across Node 20 and 22 on Linux, macOS and

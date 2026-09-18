@@ -227,7 +227,7 @@ await test("logs a load line even before any provider is examined", async () => 
   assert.match(text, /\[auto-models:server\] Loaded/);
 });
 
-// ─── v2 entrypoint ──────────────────────────────────────────────────────────
+// ─── v2 entrypoint ──────────────────────────────────────────
 
 /**
  * The v2 entrypoint has no hooks object to hang a flush on, so tests that assert
@@ -236,142 +236,73 @@ await test("logs a load line even before any provider is examined", async () => 
  */
 const drain = () => new Promise((r) => setTimeout(r, 0));
 
-/** Stand-in for v2's provider domain, matching the documented record shape. */
-function makeV2Ctx(records, { setThrows = false } = {}) {
-  const messages = [];
-  const consoleErrors = [];
-  const applied = {};
-  return {
-    applied,
-    messages,
-    consoleErrors,
-    ctx: {
-      // Same reasoning as runHook: without this the v2 path resolves a real
-      // cache directory, and a warm hit schedules a detached refresh whose
-      // completion log lands in whichever test happens to be capturing the
-      // console when it resolves.
-      options: { cache: false },
-      client: { app: { log: async ({ body }) => messages.push(body) } },
-      provider: {
-        list: async () => records,
-        transform: async (fn) => {
-          const original = console.error;
-          console.error = (...a) => consoleErrors.push(a.join(" "));
-          try {
-            const r = fn({
-              models: {
-                set: (id, models) => {
-                  if (setThrows) throw new Error("invalid model record");
-                  applied[id] = models;
-                },
-              },
-            });
-            assert.equal(r, undefined, "the transform callback must be synchronous");
-          } finally {
-            console.error = original;
-          }
-        },
-      },
-    },
-  };
+/** Captures the console, which is the only place a v2 context surfaces logs. */
+async function runSetup(ctx) {
+  const consoleLines = [];
+  const real = console.error, realInfo = console.info, realWarn = console.warn;
+  console.error = console.info = console.warn = (...a) => consoleLines.push(a.join(" "));
+  try {
+    await plugin.setup(ctx);
+  } finally {
+    await drain();
+    console.error = real; console.info = realInfo; console.warn = realWarn;
+  }
+  return { consoleLines, text: consoleLines.join("\n") };
 }
 
-const v2Record = (over = {}) => ({
-  provider: {
-    id: "p",
-    package: "@opencode/ai/providers/openai-compatible",
-    settings: { baseURL: "https://api.example.com/v1", apiKey: "sk-test" },
-    ...over,
-  },
+/**
+ * Matches the real v2 PluginContext: domain objects, a `catalog` whose
+ * `transform` takes a callback, and no `client` and no `provider`. Verified
+ * against @opencode-ai/plugin on the beta and dev tags.
+ */
+const v2Ctx = (over = {}) => ({
+  options: { cache: false },
+  catalog: { transform: async () => ({ dispose: async () => {} }), reload: async () => {} },
+  agent: {}, aisdk: {}, command: {}, integration: {}, plugin: {}, reference: {}, skill: {},
+  ...over,
 });
 
-await test("v2 setup discovers models and applies them via editor.models.set", async () => {
-  const h = makeV2Ctx([v2Record()]);
-  await plugin.setup(h.ctx);
-  await drain();
-  assert.deepEqual(h.applied.p.map((m) => m.id), ["kimi-k2.7-code", "qwen-vl-max", "tiny-1b"]);
+await test("setup() recognises a real v2 context and says it is loaded", async () => {
+  const { text } = await runSetup(v2Ctx());
+  assert.match(text, /\[auto-models:setup\] Loaded \(v2 entrypoint\)/);
 });
 
-await test("v2 models carry the required Model.Info fields", async () => {
-  const h = makeV2Ctx([v2Record()]);
-  await plugin.setup(h.ctx);
-  await drain();
-  const m = h.applied.p.find((x) => x.id === "qwen-vl-max");
-  assert.equal(m.modelID, "qwen-vl-max");
-  assert.equal(m.providerID, "p");
-  assert.equal(m.status, "active");
-  assert.equal(m.enabled, true);
-  assert.deepEqual(m.variants, []);
-  assert.deepEqual(m.cost, []);
-  assert.equal(typeof m.time.released, "number");
-  assert.deepEqual(m.limit, { context: 128000, output: 16384 });
-  // v1 `modalities` becomes v2 `capabilities`; there is no `modalities` key.
-  assert.deepEqual(m.capabilities.input, ["text", "image"]);
-  assert.deepEqual(m.capabilities.output, ["text"]);
-  assert.equal(m.capabilities.tools, true);
-  assert.equal(m.modalities, undefined);
+await test("setup() explains why discovery cannot run on v2", async () => {
+  // v2's catalog API can update, remove and re-default existing models, but
+  // nothing in it or the v2 SDK adds one, which is all this plugin does.
+  const { text } = await runSetup(v2Ctx());
+  assert.match(text, /Auto-discovery is not available on opencode v2/);
+  assert.match(text, /provider\.<id>\.models/, "and says what to do instead");
 });
 
-await test("v2 transform callback does no async work inside it", async () => {
-  // makeV2Ctx asserts the callback returns undefined rather than a promise:
-  // v2 replays transforms on every rebuild and does not await them.
-  const h = makeV2Ctx([v2Record()]);
-  await plugin.setup(h.ctx);
-  await drain();
-  assert.ok(h.applied.p, "models were still applied");
+await test("setup() makes no network request on v2", async () => {
+  await runSetup(v2Ctx());
+  assert.equal(fetchCount, 0, "there is nowhere to put the result, so nothing is fetched");
 });
 
-await test("v2 setup reports a rejected models.set instead of failing silently", async () => {
-  const h = makeV2Ctx([v2Record()], { setThrows: true });
-  await plugin.setup(h.ctx);
-  await drain();
-  assert.match(h.consoleErrors.join("\n"), /editor\.models\.set rejected 3 model\(s\) for p: .*invalid model record/s);
-});
-
-await test("v2 setup names a provider whose settings cannot be read", async () => {
-  const h = makeV2Ctx([{ provider: { id: "mystery", package: "x" } }]);
-  await plugin.setup(h.ctx);
-  await drain();
-  assert.match(h.messages.map((m) => m.message).join("\n"), /Cannot read connection settings for provider mystery/);
-});
-
-await test("v2 setup applies the same eligibility rules as v1", async () => {
-  const h = makeV2Ctx([v2Record({ settings: { baseURL: "https://api.example.com/v1", apiKey: "k", autoModels: false } })]);
-  await plugin.setup(h.ctx);
-  await drain();
-  assert.equal(h.applied.p, undefined);
-  assert.match(h.messages.map((m) => m.message).join("\n"), /Skipping p: options\.autoModels is false/);
+await test("setup() reports a catalog domain without transform()", async () => {
+  const { text } = await runSetup(v2Ctx({ catalog: {} }));
+  assert.match(text, /ctx\.catalog exists but has no transform/);
 });
 
 await test("setup() is silent when a v1 runtime calls it with a v1 input", async () => {
   // A v1 runtime calls server() and then also calls setup() on the same
   // entrypoint object. Discovery already happened; setup() must say nothing.
   const messages = [];
-  const consoleErrors = [];
-  const real = console.error, realInfo = console.info, realWarn = console.warn;
-  console.error = console.info = console.warn = (...a) => consoleErrors.push(a.join(" "));
-  try {
-    await plugin.setup({
-      client: { app: { log: async ({ body }) => messages.push(body) } },
-      project: {}, directory: "/tmp", worktree: "/tmp", $: () => {},
-    });
-  } finally {
-    await drain();
-    console.error = real; console.info = realInfo; console.warn = realWarn;
-  }
+  const { consoleLines } = await runSetup({
+    client: { app: { log: async ({ body }) => messages.push(body) } },
+    project: {}, directory: "/tmp", worktree: "/tmp", $: () => {},
+  });
   assert.deepEqual(messages, [], "no log lines on a v1 input");
-  assert.deepEqual(consoleErrors, [], "and nothing on the console either");
+  assert.deepEqual(consoleLines, [], "and nothing on the console either");
 });
 
-await test("setup() still reports a real v2 runtime whose provider domain is broken", async () => {
-  const messages = [];
-  await plugin.setup({
-    options: { cache: false },
-    client: { app: { log: async ({ body }) => messages.push(body) } },
-    provider: {},
-  });
-  await drain();
-  assert.match(messages.map((m) => m.message).join("\n"), /ctx\.provider exists but has no transform/);
+await test("setup() ignores the provider domain that never shipped", async () => {
+  // Earlier versions detected v2 by a ctx.provider domain and called
+  // editor.models.set(). Neither has existed in any published build, so a
+  // context carrying only `provider` is not a v2 runtime and must stay silent.
+  const { consoleLines } = await runSetup({ provider: { transform: async () => {} } });
+  assert.deepEqual(consoleLines, []);
 });
 
 // ─── Model-list cache ───────────────────────────────────────────────────────

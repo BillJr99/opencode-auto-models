@@ -720,146 +720,70 @@ function createV1Hooks({ client }, options) {
   };
 }
 
-// ─── v2 entrypoint ──────────────────────────────────────────────────────────
+// ─── v2 entrypoint ──────────────────────────────────────────
 
 /**
- * v2 removed the mutable global config object and the `config` hook with it.
- * Provider inventories are edited through `ctx.provider.transform`.
+ * v2 replaced the mutable global config object with domain objects on the
+ * plugin context, and a provider inventory is edited through
+ * `ctx.catalog.transform`.
  *
- * Two constraints shape the code below. The transform callback must be
- * synchronous, and it is replayed on every rebuild, so all network work happens
- * before it and only the assignment happens inside. And v2 models are
- * `Model.Info` records with a fixed shape, not the loose `{name, limit,
- * modalities}` entries v1 accepts.
+ * Auto-discovery cannot be expressed there yet. `CatalogDraft` offers
+ * `provider.list/get/update/remove` and `model.get/update/remove` alongside
+ * `model.default`, and nothing anywhere that adds a provider or a model;
+ * `ProviderV2Info` carries no model collection either, so editing a provider is
+ * not a way in. This plugin exists to add models the user has not listed, so v2
+ * currently gives it nothing to add them with. Checked against
+ * `@opencode-ai/plugin` on both the `beta` and `dev` tags and against
+ * `@opencode-ai/sdk`'s v2 types.
+ *
+ * What used to be here called `editor.models.set()` on a `ctx.provider` domain.
+ * Neither has ever existed in a published build, so on every real v2 runtime
+ * `setup()` failed its own context check and returned without a word. A plugin
+ * that silently does nothing is the exact failure mode this file is built to
+ * avoid, so it now reports the limitation instead of appearing to work.
  */
 
-/** Documented shape is ProviderRecord.provider; the rest are tolerated fallbacks. */
-function readProviderInfo(record) {
-  return record?.provider ?? record?.info ?? record ?? null;
-}
-
-function readProviderSettings(record) {
-  const info = readProviderInfo(record);
-  return info?.settings ?? info?.options ?? null;
-}
-
-/** Reshape a v2 record so the shared discovery core can judge eligibility. */
-function asDiscoveryProvider(record) {
-  const info = readProviderInfo(record) ?? {};
-  const pkg = info.package ?? info.npm;
-  return {
-    npm: typeof pkg === "string" && pkg.includes("openai-compatible") ? "@ai-sdk/openai-compatible" : pkg,
-    options: readProviderSettings(record) ?? {},
-    models: undefined,
-  };
-}
-
 /**
- * Build a v2 Model.Info. v1 carries `modalities`; v2 carries the same
- * information under `capabilities`, alongside required bookkeeping fields.
- */
-function toModelInfo(providerID, modelID, model) {
-  return {
-    id: modelID,
-    modelID,
-    providerID,
-    name: model.name ?? modelID,
-    capabilities: {
-      tools: true,
-      input: model.modalities?.input ?? ["text"],
-      output: model.modalities?.output ?? ["text"],
-    },
-    variants: [],
-    time: { released: 0 },
-    cost: [],
-    status: "active",
-    enabled: true,
-    limit: { context: model.limit?.context, output: model.limit?.output },
-  };
-}
-
-async function loadDiscoveries(ctx, settings, log) {
-  const records = (await ctx.provider.list?.()) ?? [];
-  const providers = {};
-
-  for (const record of records) {
-    const info = readProviderInfo(record);
-    const id = info?.id;
-    if (!id) continue;
-
-    if (!readProviderSettings(record)) {
-      log("warn", "setup", `Cannot read connection settings for provider ${id}; skipping it`);
-      continue;
-    }
-    providers[id] = asDiscoveryProvider(record);
-  }
-
-  return discoverAll(providers, settings, log);
-}
-
-/**
- * A v2 context exposes domain objects; `provider` is the one this plugin needs.
- * A v1 plugin input has no domains at all, carrying `client`, `project`,
- * `directory`, `worktree` and `$` instead.
+ * A v2 context exposes domain objects, and `catalog` is where providers and
+ * models live. A v1 plugin input has no domains at all, carrying `client`,
+ * `project`, `directory`, `worktree` and `$` instead.
  *
  * This matters because a v1 runtime calls `server()` and then also calls
  * `setup()` on the same entrypoint object. Discovery has already happened by
  * then, so `setup()` must recognise the v1 input and return without doing or
- * reporting anything. Detecting v2 positively, rather than inferring it from a
- * missing `transform`, keeps that case apart from a genuine v2 runtime whose
- * provider domain is broken.
+ * reporting anything.
  */
 function isV2Context(ctx) {
-  return !!ctx && typeof ctx.provider === "object" && ctx.provider !== null;
+  return !!ctx && typeof ctx.catalog === "object" && ctx.catalog !== null;
 }
 
 async function runV2Discovery(ctx) {
   if (!isV2Context(ctx)) return;
 
+  // v2 contexts carry no `client`; the console mirror in createLogger is what
+  // actually surfaces these lines there.
   const log = createLogger(ctx?.client ?? { app: { log: async () => {} } });
-  const settings = resolveSettings(ctx?.options, log);
 
   log("info", "setup", "Loaded (v2 entrypoint)");
 
-  if (typeof ctx.provider.transform !== "function") {
-    log("error", "setup", "ctx.provider exists but has no transform(); cannot auto-discover models on this runtime");
+  if (typeof ctx.catalog.transform !== "function") {
+    log(
+      "error",
+      "setup",
+      "ctx.catalog exists but has no transform(); this runtime is not one this plugin recognises."
+    );
     return;
   }
 
-  // Held outside the transform so a later reload() replays the callback against
-  // refreshed data without re-running discovery inside it.
-  const source = { discoveries: [] };
-
-  try {
-    source.discoveries = await loadDiscoveries(ctx, settings, log);
-  } catch (e) {
-    log("error", "setup", `Discovery failed: ${errorDetail(e)}`);
-    return;
-  }
-
-  try {
-    await ctx.provider.transform((editor) => {
-      for (const { task, discovered } of source.discoveries) {
-        const models = Object.entries(discovered).map(([id, model]) => toModelInfo(task.providerId, id, model));
-        try {
-          editor.models.set(task.providerId, models);
-        } catch (e) {
-          // Report a rejected record shape by name rather than leaving an empty
-          // provider and no explanation. Synchronous on purpose: the transform
-          // callback cannot await.
-          console.error(`[auto-models:setup] editor.models.set rejected ${models.length} model(s) for ${task.providerId}: ${errorDetail(e)}`);
-        }
-      }
-    });
-
-    for (const { task, discovered } of source.discoveries) {
-      log("info", "setup", `Discovered ${Object.keys(discovered).length} model(s) for ${task.providerId}`, {
-        models: Object.keys(discovered),
-      });
-    }
-  } catch (e) {
-    log("error", "setup", `Provider transform failed: ${errorDetail(e)}`);
-  }
+  log(
+    "warn",
+    "setup",
+    "Auto-discovery is not available on opencode v2. Its catalog API can update, remove and " +
+      "re-default models that already exist, but neither ctx.catalog.transform nor the v2 SDK can " +
+      "add one, and adding models you have not listed is the whole of what this plugin does. " +
+      "Until v2 grows a way to add them, list the models you need under provider.<id>.models in " +
+      "your config, or run the plugin on opencode v1, where the config hook still works."
+  );
 }
 
 // ─── Entrypoint ─────────────────────────────────────────────────────────────
