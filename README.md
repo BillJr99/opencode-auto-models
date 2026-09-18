@@ -42,16 +42,54 @@ with `opencode --version` and update if needed.
 
 ## Installation
 
-### Option 1 — From npm
+### Option 1 — Install from git
 
 ```json
 {
-  "plugin": ["@billjr99/opencode-auto-models"]
+  "plugin": [
+    "git+https://github.com/BillJr99/opencode-auto-models.git"
+  ]
 }
 ```
 
-On opencode v2 the key is `plugins`. To pin a version, append it:
-`@billjr99/opencode-auto-models@0.2.0`.
+On opencode v2 the key is `plugins` and entries take an object form:
+
+```json
+{
+  "plugins": [
+    { "package": "git+https://github.com/BillJr99/opencode-auto-models.git" }
+  ]
+}
+```
+
+opencode resolves this by installing the package at startup, which requires a
+working `git` binary in the environment opencode itself runs in. That is not
+always the environment your shell has, so if the plugin appears in your config
+but never runs, use Option 2 and check `~/.cache/opencode/packages/` to see
+whether the install actually produced anything.
+
+This plugin is not published to npm; install it from git or copy the file.
+
+### Forcing a reinstall
+
+opencode unpacks a git plugin install into a package cache and reuses
+what it finds there, so a half-finished install, or a version you have since
+changed, can persist across restarts. Deleting the package cache makes opencode
+install from scratch on the next start:
+
+```bash
+# macOS / Linux / WSL
+rm -rf ~/.cache/opencode/packages
+
+# Windows (PowerShell)
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\opencode\packages"
+```
+
+This is the *package* cache, holding the plugin code itself. It is separate from
+the model-list cache this plugin keeps under `auto-models/`, which is cleared
+independently; see [Clearing the cache](#clearing-the-cache). Clearing one does
+not clear the other, and as noted there, WSL and Windows keep separate trees, so
+clearing one of those does not touch the other either.
 
 ### Option 2 — Copy the file (works everywhere, no resolution step)
 
@@ -78,7 +116,7 @@ Use the `.mjs` extension rather than `.js`. A plugins directory has no
 CommonJS: it attempts CommonJS, fails, warns
 `MODULE_TYPELESS_PACKAGE_JSON`, and falls back to ESM. The module loads
 either way, but `.mjs` declares ESM outright and avoids relying on that
-fallback. Inside the npm package the question does not arise, because
+fallback. A git install does not face the question, because the repository's
 `package.json` sets `"type": "module"`.
 
 Files in these directories are loaded automatically at startup.
@@ -86,54 +124,6 @@ Files in these directories are loaded automatically at startup.
 Note that the WSL and Windows installs of opencode have separate config trees on
 separate filesystems, so a plugin installed under WSL is not visible to the
 Windows desktop app and vice versa.
-
-### Option 2 — Install from git
-
-```json
-{
-  "plugin": [
-    "git+https://github.com/BillJr99/opencode-auto-models.git"
-  ]
-}
-```
-
-On opencode v2 the key is `plugins` and entries take an object form:
-
-```json
-{
-  "plugins": [
-    { "package": "git+https://github.com/BillJr99/opencode-auto-models.git" }
-  ]
-}
-```
-
-opencode resolves this by installing the package at startup, which requires a
-working `git` binary in the environment opencode itself runs in. That is not
-always the environment your shell has, so if the plugin appears in your config
-but never runs, prefer Option 1 or 2 and check
-`~/.cache/opencode/packages/` to see whether the install actually produced
-anything.
-
-### Forcing a reinstall
-
-opencode unpacks git and npm plugin installs into a package cache and reuses
-what it finds there, so a half-finished install, or a version you have since
-changed, can persist across restarts. Deleting the package cache makes opencode
-install from scratch on the next start:
-
-```bash
-# macOS / Linux / WSL
-rm -rf ~/.cache/opencode/packages
-
-# Windows (PowerShell)
-Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\opencode\packages"
-```
-
-This is the *package* cache, holding the plugin code itself. It is separate from
-the model-list cache this plugin keeps under `auto-models/`, which is cleared
-independently; see [Clearing the cache](#clearing-the-cache). Clearing one does
-not clear the other, and as noted there, WSL and Windows keep separate trees, so
-clearing one of those does not touch the other either.
 
 ## Usage
 
@@ -377,7 +367,7 @@ Start by searching for `[auto-models:server] Loaded` (or `[auto-models:setup]
 Loaded` on v2). If that line is absent, the plugin was never loaded and the
 problem is installation, not discovery: check that the `plugin` entry is in the
 config opencode is actually reading, and prefer the file-copy install in
-Option 1.
+Option 2.
 
 If it is present, the following lines name every provider that was skipped and
 why.
