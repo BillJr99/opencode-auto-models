@@ -297,33 +297,147 @@ function resolveSettings(options) {
   };
 }
 
-// ─── Plugin ─────────────────────────────────────────────────────────────────
+// ─── v1 entrypoint ──────────────────────────────────────────────────────────
 
-export const AutoModelsPlugin = async ({ client }, options) => {
+function createV1Hooks({ client }, options) {
   const log = createLogger(client);
   const settings = resolveSettings(options);
 
-  // If this line is absent from the log, the plugin was never loaded at all —
-  // the single most useful signal when diagnosing a GUI front-end.
-  await log("info", "AutoModelsPlugin", `Loaded (timeout=${settings.timeoutMs}ms, retries=${settings.retries}${settings.dryRun ? ", dry-run" : ""})`);
-
   return {
-    config: async (config) => {
-      try {
-        const providers = config.provider ?? {};
-        await log("info", "config", `Config hook running over ${Object.keys(providers).length} provider(s)`);
+    log,
+    hooks: {
+      config: async (config) => {
+        try {
+          const providers = config.provider ?? {};
+          await log("info", "config", `Config hook running over ${Object.keys(providers).length} provider(s)`);
 
-        const discoveries = await discoverAll(providers, settings, log);
+          const discoveries = await discoverAll(providers, settings, log);
 
-        for (const { task, discovered } of discoveries) {
-          task.provider.models = mergeWithManual(discovered, task.existingModels);
-          await log("info", "config", `Discovered ${Object.keys(discovered).length} model(s) for ${task.providerId}`, {
-            models: Object.keys(discovered),
-          });
+          for (const { task, discovered } of discoveries) {
+            task.provider.models = mergeWithManual(discovered, task.existingModels);
+            await log("info", "config", `Discovered ${Object.keys(discovered).length} model(s) for ${task.providerId}`, {
+              models: Object.keys(discovered),
+            });
+          }
+        } catch (e) {
+          await log("error", "config", `Config hook failed: ${errorDetail(e)}`);
         }
-      } catch (e) {
-        await log("error", "config", `Config hook failed: ${errorDetail(e)}`);
-      }
+      },
     },
   };
+}
+
+// ─── v2 entrypoint ──────────────────────────────────────────────────────────
+
+/**
+ * v2 removed the mutable global config object and the `config` hook with it.
+ * The replacement is a per-domain transform: provider settings and model
+ * inventories are edited through `ctx.provider.transform(editor => ...)`.
+ *
+ * Read a provider record's connection settings. v2's own docs show these under
+ * `info.settings`, but the record shape is not pinned down by any published
+ * schema, so the alternatives are probed rather than assumed. A record whose
+ * settings cannot be located is reported by name instead of skipped silently.
+ */
+function readProviderSettings(record) {
+  return record?.info?.settings ?? record?.settings ?? record?.info?.options ?? record?.options ?? null;
+}
+
+function readProviderPackage(record) {
+  return record?.info?.package ?? record?.package ?? record?.info?.npm ?? record?.npm ?? null;
+}
+
+/**
+ * Reshape a v1 provider record into the shape the discovery core expects, so
+ * both runtimes share one code path for eligibility, filtering and limits.
+ */
+function asDiscoveryProvider(record) {
+  const settings = readProviderSettings(record) ?? {};
+  const pkg = readProviderPackage(record);
+  return {
+    // v2 package ids end in the same driver name the v1 `npm` field carries.
+    npm: typeof pkg === "string" && pkg.includes("openai-compatible") ? "@ai-sdk/openai-compatible" : pkg,
+    options: settings,
+    models: undefined,
+  };
+}
+
+async function runV2Discovery(ctx, options) {
+  const log = createLogger(ctx?.client ?? { app: { log: async () => {} } });
+  const settings = resolveSettings(options ?? ctx?.options);
+
+  await log("info", "setup", "Loaded (v2 entrypoint)");
+
+  if (typeof ctx?.provider?.transform !== "function") {
+    await log("error", "setup", "ctx.provider.transform is unavailable; cannot auto-discover models on this runtime");
+    return;
+  }
+
+  try {
+    await ctx.provider.transform(async (editor) => {
+      const records = editor.list();
+      const providers = {};
+      const byId = new Map();
+
+      for (const record of records) {
+        const id = record?.info?.id ?? record?.id;
+        if (!id) continue;
+
+        if (!readProviderSettings(record)) {
+          await log("warn", "setup", `Cannot read connection settings for provider ${id}; skipping it`);
+          continue;
+        }
+
+        providers[id] = asDiscoveryProvider(record);
+        byId.set(id, record);
+      }
+
+      const discoveries = await discoverAll(providers, settings, log);
+
+      for (const { task, discovered } of discoveries) {
+        const models = Object.entries(discovered).map(([id, model]) => ({ id, ...model }));
+        try {
+          editor.models.set(task.providerId, models);
+          await log("info", "setup", `Discovered ${models.length} model(s) for ${task.providerId}`, {
+            models: models.map((m) => m.id),
+          });
+        } catch (e) {
+          // The model record shape v2 accepts is not pinned by a published
+          // schema. Report the rejection loudly rather than leaving an empty
+          // provider and no explanation.
+          await log("error", "setup", `editor.models.set rejected ${models.length} model(s) for ${task.providerId}: ${errorDetail(e)}`);
+        }
+      }
+    });
+  } catch (e) {
+    await log("error", "setup", `Provider transform failed: ${errorDetail(e)}`);
+  }
+}
+
+// ─── Entrypoint ─────────────────────────────────────────────────────────────
+
+/**
+ * One default export serving both runtimes, per opencode's v1-to-v2 migration
+ * guide: v1 calls `server()` and ignores `setup()`, v2 does the reverse.
+ *
+ * Object entrypoints require opencode 1.18.29 or newer. This is the module's
+ * only export on purpose: the v1 loader iterates every export, so a second one
+ * would register the hook twice and fetch every provider twice per config load.
+ *
+ * `id` and `setup` are declared literally rather than through
+ * `Plugin.define()` so the plugin keeps zero dependencies and can be dropped
+ * into a plugins directory as a single file.
+ */
+export default {
+  id: "auto-models",
+  async setup(ctx) {
+    await runV2Discovery(ctx, ctx?.options);
+  },
+  async server(input, options) {
+    const { log, hooks } = createV1Hooks(input, options);
+    // If this line is absent from the log, the plugin was never loaded at all —
+    // the single most useful signal when diagnosing a GUI front-end.
+    await log("info", "server", "Loaded (v1 entrypoint)");
+    return hooks;
+  },
 };

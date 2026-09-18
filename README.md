@@ -17,11 +17,21 @@ models from OpenAI-compatible providers, so you don't have to maintain a manual
 - **Dependency-free plain JavaScript**: a single file with no imports and no
   build step, so it loads anywhere opencode runs, including the Windows desktop
   app.
+- **Runs on opencode v1 and v2**: one file serves both plugin contracts.
 - **Loud about failures**: every provider it skips, and every reason, is logged.
   A plugin that quietly does nothing is indistinguishable from one that is not
   installed, which is the failure mode this is built to avoid.
 - **Safe defaults**: requests time out and are retried once, so a slow provider
   cannot hang opencode startup, and one failing provider cannot affect another.
+
+## Requirements
+
+opencode **1.18.29 or newer**, or opencode v2.
+
+The plugin ships a single object entrypoint that both runtimes understand: v1
+calls its `server()` and v2 calls its `setup()`. Object entrypoints landed in
+opencode 1.18.29, so on an older v1 build the plugin is not recognised. Check
+with `opencode --version` and update if needed.
 
 ## Installation
 
@@ -44,12 +54,26 @@ On Windows, copy it to `C:\Users\<You>\.config\opencode\plugins\auto-models.js`.
 
 Files in these directories are loaded automatically at startup.
 
+Note that the WSL and Windows installs of opencode have separate config trees on
+separate filesystems, so a plugin installed under WSL is not visible to the
+Windows desktop app and vice versa.
+
 ### Option 2 — Install from git
 
 ```json
 {
   "plugin": [
     "git+https://github.com/BillJr99/opencode-auto-models.git"
+  ]
+}
+```
+
+On opencode v2 the key is `plugins` and entries take an object form:
+
+```json
+{
+  "plugins": [
+    { "package": "git+https://github.com/BillJr99/opencode-auto-models.git" }
   ]
 }
 ```
@@ -161,7 +185,9 @@ If you load the plugin via the `plugin` array, you can pass options:
 
 ## How it works
 
-When opencode loads the config, the plugin's `config` hook runs. A provider is
+### On opencode v1
+
+The plugin's `config` hook runs when opencode loads the config. A provider is
 eligible when it:
 
 1. uses `npm: "@ai-sdk/openai-compatible"` (or has `options.autoModels: true`),
@@ -174,6 +200,22 @@ are unaffected.
 
 Every provider that is *not* eligible is logged with the specific reason, so an
 empty model list is always explainable.
+
+### On opencode v2
+
+v2 removed the mutable global config object and the `config` hook with it, so
+discovery runs from `setup()` instead and applies its results through
+`ctx.provider.transform(editor => editor.models.set(...))`. Eligibility,
+filtering and limit rules are shared with the v1 path.
+
+Two caveats apply to the v2 path specifically. The provider record shape is read
+defensively, because no published schema pins down where a provider's connection
+settings live, and the model record shape that `editor.models.set` accepts is
+likewise unpinned. If either differs from what this plugin sends, it reports the
+rejection by name rather than leaving you with an empty provider and no
+explanation. The v1 path is covered by the test suite against a stubbed client;
+the v2 path is covered against a stubbed provider domain, not against a live v2
+runtime.
 
 ## Model context limits
 

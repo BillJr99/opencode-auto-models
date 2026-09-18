@@ -4,7 +4,7 @@
  * without an opencode install.
  */
 import assert from "node:assert/strict";
-import { AutoModelsPlugin } from "../src/index.js";
+import plugin from "../src/index.js";
 
 const MODELS = [{ id: "kimi-k2.7-code" }, { id: "qwen-vl-max" }, { id: "tiny-1b" }];
 
@@ -33,7 +33,7 @@ async function runHook(config, pluginOptions, { logThrows = false } = {}) {
       },
     },
   };
-  const hooks = await AutoModelsPlugin({ client }, pluginOptions);
+  const hooks = await plugin.server({ client }, pluginOptions);
   await hooks.config(config);
   return { config, messages, text: messages.map((m) => m.message).join("\n") };
 }
@@ -65,11 +65,6 @@ await test("applies default limits and infers image modality", async () => {
   assert.deepEqual(config.provider.p.models["tiny-1b"].limit, { context: 128000, output: 16384 });
   assert.deepEqual(config.provider.p.models["qwen-vl-max"].modalities.input, ["text", "image"]);
   assert.deepEqual(config.provider.p.models["tiny-1b"].modalities.input, ["text"]);
-});
-
-await test("logs a load line even before any provider is examined", async () => {
-  const { text } = await runHook({ provider: {} });
-  assert.match(text, /\[auto-models:AutoModelsPlugin\] Loaded/);
 });
 
 await test("explains the skip when a manual models block exists", async () => {
@@ -153,11 +148,81 @@ await test("baseURL without a trailing slash still resolves to /models", async (
   assert.match(text, /https:\/\/broken\.example\/v1\/models/);
 });
 
-await test("exports exactly one plugin entry point", async () => {
+await test("exports exactly one entry point, carrying both runtimes", async () => {
   const mod = await import("../src/index.js");
-  // opencode's v1 loader iterates every export, so a duplicate registers the
+  // opencode's v1 loader iterates every export, so a second one registers the
   // hook twice and fetches every provider twice per config load.
-  assert.deepEqual(Object.keys(mod), ["AutoModelsPlugin"]);
+  assert.deepEqual(Object.keys(mod), ["default"]);
+  assert.equal(mod.default.id, "auto-models");
+  assert.equal(typeof mod.default.setup, "function", "v2 reads setup()");
+  assert.equal(typeof mod.default.server, "function", "v1 reads server()");
+});
+
+await test("logs a load line even before any provider is examined", async () => {
+  const { text } = await runHook({ provider: {} });
+  assert.match(text, /\[auto-models:server\] Loaded/);
+});
+
+// ─── v2 entrypoint ──────────────────────────────────────────────────────────
+
+/** Minimal stand-in for v2's provider domain. */
+function makeV2Ctx(records, { setThrows = false } = {}) {
+  const messages = [];
+  const applied = {};
+  return {
+    applied,
+    messages,
+    ctx: {
+      client: { app: { log: async ({ body }) => messages.push(body) } },
+      provider: {
+        transform: async (fn) => fn({
+          list: () => records,
+          models: {
+            set: (id, models) => {
+              if (setThrows) throw new Error("invalid model record");
+              applied[id] = models;
+            },
+          },
+        }),
+      },
+    },
+  };
+}
+
+const v2Record = (over = {}) => ({
+  info: {
+    id: "p",
+    package: "@opencode/ai/providers/openai-compatible",
+    settings: { baseURL: "https://api.example.com/v1", apiKey: "sk-test" },
+    ...over,
+  },
+});
+
+await test("v2 setup discovers models and applies them via editor.models.set", async () => {
+  const h = makeV2Ctx([v2Record()]);
+  await plugin.setup(h.ctx);
+  assert.deepEqual(h.applied.p.map((m) => m.id), ["kimi-k2.7-code", "qwen-vl-max", "tiny-1b"]);
+  assert.equal(h.applied.p[0].limit.context, 128000);
+});
+
+await test("v2 setup reports a rejected models.set instead of failing silently", async () => {
+  const h = makeV2Ctx([v2Record()], { setThrows: true });
+  await plugin.setup(h.ctx);
+  const text = h.messages.map((m) => m.message).join("\n");
+  assert.match(text, /editor\.models\.set rejected 3 model\(s\) for p: .*invalid model record/s);
+});
+
+await test("v2 setup names a provider whose settings cannot be read", async () => {
+  const h = makeV2Ctx([{ info: { id: "mystery", package: "x" } }]);
+  await plugin.setup(h.ctx);
+  const text = h.messages.map((m) => m.message).join("\n");
+  assert.match(text, /Cannot read connection settings for provider mystery/);
+});
+
+await test("v2 setup reports a runtime with no provider.transform", async () => {
+  const messages = [];
+  await plugin.setup({ client: { app: { log: async ({ body }) => messages.push(body) } } });
+  assert.match(messages.map((m) => m.message).join("\n"), /ctx\.provider\.transform is unavailable/);
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);
