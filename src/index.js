@@ -417,14 +417,32 @@ async function loadDiscoveries(ctx, settings, log) {
   return discoverAll(providers, settings, log);
 }
 
+/**
+ * A v2 context exposes domain objects; `provider` is the one this plugin needs.
+ * A v1 plugin input has no domains at all, carrying `client`, `project`,
+ * `directory`, `worktree` and `$` instead.
+ *
+ * This matters because a v1 runtime calls `server()` and then also calls
+ * `setup()` on the same entrypoint object. Discovery has already happened by
+ * then, so `setup()` must recognise the v1 input and return without doing or
+ * reporting anything. Detecting v2 positively, rather than inferring it from a
+ * missing `transform`, keeps that case apart from a genuine v2 runtime whose
+ * provider domain is broken.
+ */
+function isV2Context(ctx) {
+  return !!ctx && typeof ctx.provider === "object" && ctx.provider !== null;
+}
+
 async function runV2Discovery(ctx) {
+  if (!isV2Context(ctx)) return;
+
   const log = createLogger(ctx?.client ?? { app: { log: async () => {} } });
   const settings = resolveSettings(ctx?.options);
 
   await log("info", "setup", "Loaded (v2 entrypoint)");
 
-  if (typeof ctx?.provider?.transform !== "function") {
-    await log("error", "setup", "ctx.provider.transform is unavailable; cannot auto-discover models on this runtime");
+  if (typeof ctx.provider.transform !== "function") {
+    await log("error", "setup", "ctx.provider exists but has no transform(); cannot auto-discover models on this runtime");
     return;
   }
 

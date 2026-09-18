@@ -282,10 +282,32 @@ await test("v2 setup applies the same eligibility rules as v1", async () => {
   assert.match(h.messages.map((m) => m.message).join("\n"), /Skipping p: options\.autoModels is false/);
 });
 
-await test("v2 setup reports a runtime with no provider.transform", async () => {
+await test("setup() is silent when a v1 runtime calls it with a v1 input", async () => {
+  // A v1 runtime calls server() and then also calls setup() on the same
+  // entrypoint object. Discovery already happened; setup() must say nothing.
   const messages = [];
-  await plugin.setup({ client: { app: { log: async ({ body }) => messages.push(body) } } });
-  assert.match(messages.map((m) => m.message).join("\n"), /ctx\.provider\.transform is unavailable/);
+  const consoleErrors = [];
+  const real = console.error, realInfo = console.info, realWarn = console.warn;
+  console.error = console.info = console.warn = (...a) => consoleErrors.push(a.join(" "));
+  try {
+    await plugin.setup({
+      client: { app: { log: async ({ body }) => messages.push(body) } },
+      project: {}, directory: "/tmp", worktree: "/tmp", $: () => {},
+    });
+  } finally {
+    console.error = real; console.info = realInfo; console.warn = realWarn;
+  }
+  assert.deepEqual(messages, [], "no log lines on a v1 input");
+  assert.deepEqual(consoleErrors, [], "and nothing on the console either");
+});
+
+await test("setup() still reports a real v2 runtime whose provider domain is broken", async () => {
+  const messages = [];
+  await plugin.setup({
+    client: { app: { log: async ({ body }) => messages.push(body) } },
+    provider: {},
+  });
+  assert.match(messages.map((m) => m.message).join("\n"), /ctx\.provider exists but has no transform/);
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);
