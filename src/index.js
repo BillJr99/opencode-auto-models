@@ -493,15 +493,16 @@ function collectProviderTasks(providers, settings, log, authEntries = new Map())
       continue;
     }
 
+    // A manual models block no longer opts a provider out: discovered models are
+    // added alongside it, and the manual entries are merged on top as overrides.
     const existingModels = provider.models;
-    if (existingModels && Object.keys(existingModels).length > 0 && autoModelsFlag !== true) {
+    if (existingModels && Object.keys(existingModels).length > 0) {
       log(
         "info",
         "collectProviderTasks",
-        `Skipping ${providerId}: it already defines ${Object.keys(existingModels).length} model(s) manually. ` +
-          `Set options.autoModels: true to discover additional models and merge your overrides on top.`
+        `${providerId} already defines ${Object.keys(existingModels).length} model(s) manually; ` +
+          `discovering the rest and keeping those entries as overrides`
       );
-      continue;
     }
 
     const includeFilter = opts.autoModelsInclude ? new RegExp(opts.autoModelsInclude, "i") : null;

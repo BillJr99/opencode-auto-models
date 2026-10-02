@@ -139,9 +139,9 @@ block out entirely:
 
 On startup the plugin fetches the model list and populates `models` for you.
 
-To keep manual overrides for specific models *and* still discover the rest, set
-`autoModels: true`. Without it, a provider that already defines any models is
-left alone:
+A provider that already lists some models is still discovered: the listed
+entries are kept and act as overrides, and every other model the endpoint
+reports is added alongside them:
 
 ```json
 {
@@ -151,8 +151,7 @@ left alone:
       "name": "My Provider",
       "options": {
         "baseURL": "https://api.example.com/v1",
-        "apiKey": "{env:MY_PROVIDER_API_KEY}",
-        "autoModels": true
+        "apiKey": "{env:MY_PROVIDER_API_KEY}"
       },
       "models": {
         "kimi-k2.7-code-fast": {
@@ -167,7 +166,8 @@ left alone:
 ```
 
 The plugin discovers all other models and merges your metadata on top of the
-discovered defaults.
+discovered defaults. To leave a provider's list exactly as written, set
+`autoModels: false`.
 
 ## Provider options
 
@@ -175,7 +175,7 @@ Set these inside `provider.options`:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `autoModels` | `true` for `@ai-sdk/openai-compatible`, otherwise `false` | Whether to auto-discover models for this provider. `false` disables it; `true` both opts a non-openai-compatible provider in and allows discovery alongside a manual `models` block. |
+| `autoModels` | `true` for `@ai-sdk/openai-compatible`, otherwise `false` | Whether to auto-discover models for this provider. `false` disables it; `true` opts a non-openai-compatible provider in. A manual `models` block does not disable discovery; it is merged on top. |
 | `baseURL` | — | The OpenAI-compatible API base URL (normally ends with `/v1`). |
 | `apiKey` | — | API key used for the `Authorization: Bearer` header. Falls back to the key stored by `opencode auth login` (see below). |
 | `autoModelsContext` | `128000` | Default context limit for every auto-discovered model of this provider. |
@@ -300,7 +300,10 @@ eligible when it:
 
 1. uses `npm: "@ai-sdk/openai-compatible"` (or has `options.autoModels: true`),
 2. has `options.baseURL` (the key comes from `options.apiKey`, else `auth.json`, else none),
-3. has no manual `models` block (or has `options.autoModels: true`).
+3. does not set `options.autoModels: false`.
+
+A manual `models` block does not make a provider ineligible; its entries are
+merged over the discovered ones.
 
 Eligible providers are fetched in parallel and translated from `data[].id` into
 model entries. A provider that fails is logged and left unchanged; the others

@@ -112,10 +112,21 @@ await test("applies default limits and infers image modality", async () => {
   assert.deepEqual(config.provider.p.models["tiny-1b"].modalities.input, ["text"]);
 });
 
-await test("explains the skip when a manual models block exists", async () => {
+await test("a manual models block is kept and discovery still adds the rest", async () => {
   const { config, text } = await runHook({ provider: { p: provider({ models: { mine: { name: "mine" } } }) } });
-  assert.deepEqual(Object.keys(config.provider.p.models), ["mine"]);
-  assert.match(text, /Skipping p: it already defines 1 model\(s\) manually/);
+  assert.deepEqual(Object.keys(config.provider.p.models).sort(), ["kimi-k2.7-code", "mine", "qwen-vl-max", "tiny-1b"]);
+  assert.deepEqual(config.provider.p.models.mine, { name: "mine" }, "a manual-only model is kept as written");
+  assert.match(text, /p already defines 1 model\(s\) manually; discovering the rest/);
+});
+
+await test("a manual models block merges over discovered defaults without autoModels", async () => {
+  const { config } = await runHook({
+    provider: { p: provider({ models: { "tiny-1b": { name: "TINY", limit: { context: 9, output: 9 } } } }) },
+  });
+  assert.equal(Object.keys(config.provider.p.models).length, 3);
+  assert.equal(config.provider.p.models["tiny-1b"].name, "TINY");
+  assert.deepEqual(config.provider.p.models["tiny-1b"].limit, { context: 9, output: 9 });
+  assert.deepEqual(config.provider.p.models["tiny-1b"].modalities.input, ["text"], "discovered fields fill the gaps");
 });
 
 await test("explains the skip when autoModels is false", async () => {
