@@ -27,6 +27,8 @@ process.on("unhandledRejection", (e) => unhandled.push(e));
  */
 const SANDBOX = await fs.mkdtemp(path.join(os.tmpdir(), "auto-models-sandbox-"));
 process.env.OPENCODE_AUTO_MODELS_CACHE_DIR = SANDBOX;
+// Likewise, never read the developer's real opencode auth.json.
+process.env.OPENCODE_AUTO_MODELS_AUTH_FILE = path.join(SANDBOX, "no-such-auth.json");
 
 let fetchCount = 0;
 let fetchImpl = async (url) => {
@@ -110,10 +112,21 @@ await test("applies default limits and infers image modality", async () => {
   assert.deepEqual(config.provider.p.models["tiny-1b"].modalities.input, ["text"]);
 });
 
-await test("explains the skip when a manual models block exists", async () => {
+await test("a manual models block is kept and discovery still adds the rest", async () => {
   const { config, text } = await runHook({ provider: { p: provider({ models: { mine: { name: "mine" } } }) } });
-  assert.deepEqual(Object.keys(config.provider.p.models), ["mine"]);
-  assert.match(text, /Skipping p: it already defines 1 model\(s\) manually/);
+  assert.deepEqual(Object.keys(config.provider.p.models).sort(), ["kimi-k2.7-code", "mine", "qwen-vl-max", "tiny-1b"]);
+  assert.deepEqual(config.provider.p.models.mine, { name: "mine" }, "a manual-only model is kept as written");
+  assert.match(text, /p already defines 1 model\(s\) manually; discovering the rest/);
+});
+
+await test("a manual models block merges over discovered defaults without autoModels", async () => {
+  const { config } = await runHook({
+    provider: { p: provider({ models: { "tiny-1b": { name: "TINY", limit: { context: 9, output: 9 } } } }) },
+  });
+  assert.equal(Object.keys(config.provider.p.models).length, 3);
+  assert.equal(config.provider.p.models["tiny-1b"].name, "TINY");
+  assert.deepEqual(config.provider.p.models["tiny-1b"].limit, { context: 9, output: 9 });
+  assert.deepEqual(config.provider.p.models["tiny-1b"].modalities.input, ["text"], "discovered fields fill the gaps");
 });
 
 await test("explains the skip when autoModels is false", async () => {
@@ -126,7 +139,7 @@ await test("discovers from an unauthenticated endpoint with no apiKey", async ()
     provider: { p: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "https://api.example.com/v1" } } },
   });
   assert.equal(Object.keys(config.provider.p.models).length, 3, "a local proxy needs no key");
-  assert.match(text, /p has no options\.apiKey; querying .* unauthenticated/);
+  assert.match(text, /p has no options\.apiKey and no auth\.json entry; querying .* unauthenticated/);
 });
 
 await test("omits the Authorization header entirely when there is no apiKey", async () => {
@@ -508,6 +521,82 @@ await test("an unwritable cache directory degrades to a plain fetch", async () =
     );
     assert.equal(Object.keys(config.provider.p.models).length, 3, "discovery still works without a cache");
     assert.match(text, /Cannot write the model cache/);
+  });
+});
+
+// ─── auth.json fallback ─────────────────────────────────────────────────────
+
+const keyless = () => ({ npm: "@ai-sdk/openai-compatible", options: { baseURL: "https://api.example.com/v1" } });
+
+async function captureHeaders(fn) {
+  const seen = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = async (url, init) => { seen.push(init.headers); return real(url, init); };
+  try {
+    const result = await fn();
+    return { seen, result };
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
+await test("an auth.json api key is used when options.apiKey is absent", async () => {
+  const { seen, result } = await captureHeaders(() =>
+    runHook({ provider: { p: keyless() } }, { authKeys: { p: { type: "api", key: "sk-auth-secret" } } })
+  );
+  assert.equal(seen[0].Authorization, "Bearer sk-auth-secret");
+  assert.equal(Object.keys(result.config.provider.p.models).length, 3);
+  assert.match(result.text, /using the credential stored by `opencode auth login`/);
+  assert.doesNotMatch(result.text, /sk-auth-secret/, "the key is never logged");
+});
+
+await test("options.apiKey wins over auth.json", async () => {
+  const { seen } = await captureHeaders(() =>
+    runHook({ provider: { p: provider() } }, { authKeys: { p: { type: "api", key: "sk-auth" } } })
+  );
+  assert.equal(seen[0].Authorization, "Bearer sk-test");
+});
+
+await test("an auth.json entry for another provider id is not used", async () => {
+  const { seen } = await captureHeaders(() =>
+    runHook({ provider: { p: keyless() } }, { authKeys: { other: { type: "api", key: "sk-other" } } })
+  );
+  assert.equal("Authorization" in seen[0], false);
+});
+
+await test("a non-api auth.json entry is named and not used", async () => {
+  const { seen, result } = await captureHeaders(() =>
+    runHook({ provider: { p: keyless() } }, { authKeys: { p: { type: "oauth", access: "tok" } } })
+  );
+  assert.equal("Authorization" in seen[0], false);
+  assert.match(result.text, /auth\.json entry of type "oauth", which this plugin cannot use/);
+});
+
+await test("a real auth.json file is read, and its key never reaches the cache", async () => {
+  await withTempDir(async (root) => {
+    const authFile = path.join(root, "auth.json");
+    await fs.writeFile(authFile, JSON.stringify({ p: { type: "api", key: "sk-file-secret" } }));
+    const dir = path.join(root, "cache");
+    const { seen } = await captureHeaders(() =>
+      runHook({ provider: { p: keyless() } }, { authFile, cache: true, cacheDir: dir })
+    );
+    assert.equal(seen[0].Authorization, "Bearer sk-file-secret");
+    for (const f of await fs.readdir(dir)) {
+      assert.doesNotMatch(await fs.readFile(path.join(dir, f), "utf8"), /sk-file-secret/);
+    }
+  });
+});
+
+await test("a missing or corrupt auth.json does not break discovery", async () => {
+  await withTempDir(async (root) => {
+    const missing = await runHook({ provider: { p: keyless() } }, { authFile: path.join(root, "nope.json") });
+    assert.equal(Object.keys(missing.config.provider.p.models).length, 3);
+
+    const corrupt = path.join(root, "auth.json");
+    await fs.writeFile(corrupt, "{not json");
+    const bad = await runHook({ provider: { p: keyless() } }, { authFile: corrupt });
+    assert.equal(Object.keys(bad.config.provider.p.models).length, 3);
+    assert.match(bad.text, /Cannot parse .*auth\.json; ignoring it/);
   });
 });
 

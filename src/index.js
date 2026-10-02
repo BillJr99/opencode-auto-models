@@ -22,6 +22,7 @@
  *   cacheDir             - override the cache directory
  *   cacheTtl             - cache lifetime in ms (default: 86400000, 24h)
  *   refresh              - ignore cached entries for this run
+ *   authFile             - path to opencode's auth.json (default: opencode's data dir)
  */
 
 const DEFAULT_TIMEOUT_MS = 8000;
@@ -245,6 +246,63 @@ function resolveCacheDir(options, env, sep) {
 }
 
 /**
+ * `opencode auth login` stores credentials in `<data>/opencode/auth.json`, keyed
+ * by provider id, rather than in the config the `config` hook receives. opencode
+ * resolves its data directory through xdg-basedir, which falls back to
+ * ~/.local/share on every OS — including Windows — so the same dot-directory
+ * layout as the cache applies.
+ */
+function resolveAuthFile(options, env, sep) {
+  if (typeof options?.authFile === "string" && options.authFile) return options.authFile;
+  if (env.OPENCODE_AUTO_MODELS_AUTH_FILE) return env.OPENCODE_AUTO_MODELS_AUTH_FILE;
+  if (env.XDG_DATA_HOME) return [env.XDG_DATA_HOME, "opencode", "auth.json"].join(sep);
+  if (sep === "\\" && env.USERPROFILE) return [env.USERPROFILE, ".local", "share", "opencode", "auth.json"].join(sep);
+  if (env.HOME) return [env.HOME, ".local", "share", "opencode", "auth.json"].join(sep);
+  return null;
+}
+
+/**
+ * Returns Map(providerId -> { type, key }). Every failure — no fs, no file, bad
+ * JSON — is just an empty map: auth.json is a fallback, and its absence must
+ * never fail discovery. Key material is never logged.
+ */
+async function loadAuthEntries(settings, log) {
+  const entries = new Map();
+
+  const add = (raw) => {
+    if (!raw || typeof raw !== "object") return;
+    for (const [id, entry] of Object.entries(raw)) {
+      if (typeof entry === "string") entries.set(id, { type: "api", key: entry });
+      else if (entry && typeof entry === "object") entries.set(id, { type: entry.type, key: entry.key });
+    }
+  };
+
+  if (settings.authKeys) {
+    add(settings.authKeys);
+    return entries;
+  }
+  if (!settings.authFile) return entries;
+
+  const fs = await loadFs();
+  if (!fs) return entries;
+
+  let text;
+  try {
+    text = await fs.readFile(settings.authFile, "utf8");
+  } catch {
+    log("info", "loadAuthEntries", `No opencode credential file at ${settings.authFile}; using options.apiKey only`);
+    return entries;
+  }
+
+  try {
+    add(JSON.parse(text));
+  } catch (e) {
+    log("warn", "loadAuthEntries", `Cannot parse ${settings.authFile}; ignoring it: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return entries;
+}
+
+/**
  * Provider ids come from user config, so an id of `../../../etc` must not be
  * able to escape the cache directory. The slug is also what makes the directory
  * legible to a human running `ls`.
@@ -367,7 +425,7 @@ function readEntry(text, task, now) {
  * Every skip here used to be a silent `continue`, which made a non-working
  * plugin indistinguishable from a working one on any GUI front-end.
  */
-function collectProviderTasks(providers, settings, log) {
+function collectProviderTasks(providers, settings, log, authEntries = new Map()) {
   const tasks = [];
 
   for (const [providerId, provider] of Object.entries(providers)) {
@@ -377,7 +435,8 @@ function collectProviderTasks(providers, settings, log) {
     }
 
     const opts = provider.options ?? {};
-    const { baseURL, apiKey } = opts;
+    const { baseURL } = opts;
+    let apiKey = opts.apiKey;
 
     if (!baseURL) {
       log(
@@ -389,14 +448,31 @@ function collectProviderTasks(providers, settings, log) {
     }
 
     if (!apiKey) {
-      // Not a skip: unauthenticated endpoints are a normal case.
-      log(
-        "info",
-        "collectProviderTasks",
-        `${providerId} has no options.apiKey; querying ${baseURL} unauthenticated. ` +
-          `Note that credentials stored via \`opencode auth login\` (auth.json) are not visible ` +
-          `to this plugin, so set options.apiKey here if this endpoint needs one.`
-      );
+      // Not a skip: unauthenticated endpoints are a normal case. But a provider
+      // set up with `opencode auth login` keeps its key in auth.json, not here.
+      const stored = authEntries.get(providerId);
+      if (stored && stored.type === "api" && typeof stored.key === "string" && stored.key) {
+        apiKey = stored.key;
+        log(
+          "info",
+          "collectProviderTasks",
+          `${providerId} has no options.apiKey; using the credential stored by \`opencode auth login\` (auth.json)`
+        );
+      } else if (stored) {
+        log(
+          "warn",
+          "collectProviderTasks",
+          `${providerId} has an auth.json entry of type ${JSON.stringify(stored.type)}, which this plugin cannot use; ` +
+            `querying ${baseURL} unauthenticated. Set options.apiKey if this endpoint needs a key.`
+        );
+      } else {
+        log(
+          "info",
+          "collectProviderTasks",
+          `${providerId} has no options.apiKey and no auth.json entry; querying ${baseURL} unauthenticated. ` +
+            `Set options.apiKey or run \`opencode auth login\` if this endpoint needs a key.`
+        );
+      }
     }
 
     const isOpenAICompatible = provider.npm === "@ai-sdk/openai-compatible";
@@ -417,15 +493,16 @@ function collectProviderTasks(providers, settings, log) {
       continue;
     }
 
+    // A manual models block no longer opts a provider out: discovered models are
+    // added alongside it, and the manual entries are merged on top as overrides.
     const existingModels = provider.models;
-    if (existingModels && Object.keys(existingModels).length > 0 && autoModelsFlag !== true) {
+    if (existingModels && Object.keys(existingModels).length > 0) {
       log(
         "info",
         "collectProviderTasks",
-        `Skipping ${providerId}: it already defines ${Object.keys(existingModels).length} model(s) manually. ` +
-          `Set options.autoModels: true to discover additional models and merge your overrides on top.`
+        `${providerId} already defines ${Object.keys(existingModels).length} model(s) manually; ` +
+          `discovering the rest and keeping those entries as overrides`
       );
-      continue;
     }
 
     const includeFilter = opts.autoModelsInclude ? new RegExp(opts.autoModelsInclude, "i") : null;
@@ -576,7 +653,8 @@ async function resolveTaskData(task, settings, log) {
  * same core serves the v1 `config` hook and any future v2 registration path.
  */
 async function discoverAll(providers, settings, log) {
-  const tasks = collectProviderTasks(providers, settings, log);
+  const authEntries = await loadAuthEntries(settings, log);
+  const tasks = collectProviderTasks(providers, settings, log, authEntries);
 
   if (tasks.length === 0) {
     log("info", "discoverAll", "No eligible providers for auto-discovery");
@@ -667,6 +745,9 @@ function resolveSettings(options, log) {
     cache,
     cacheTtlMs: typeof options?.cacheTtl === "number" ? options.cacheTtl : DEFAULT_CACHE_TTL_MS,
     refresh: options?.refresh === true || env.OPENCODE_AUTO_MODELS_REFRESH === "1",
+    authFile: resolveAuthFile(options, env, sep),
+    // Test seam, like cacheStore: { providerId: "key" | { type, key } }.
+    authKeys: options?.authKeys && typeof options.authKeys === "object" ? options.authKeys : null,
     store,
     now: typeof options?.now === "function" ? options.now : Date.now,
     // Scoped per plugin instance rather than module-wide, so a config reload

@@ -139,9 +139,9 @@ block out entirely:
 
 On startup the plugin fetches the model list and populates `models` for you.
 
-To keep manual overrides for specific models *and* still discover the rest, set
-`autoModels: true`. Without it, a provider that already defines any models is
-left alone:
+A provider that already lists some models is still discovered: the listed
+entries are kept and act as overrides, and every other model the endpoint
+reports is added alongside them:
 
 ```json
 {
@@ -151,8 +151,7 @@ left alone:
       "name": "My Provider",
       "options": {
         "baseURL": "https://api.example.com/v1",
-        "apiKey": "{env:MY_PROVIDER_API_KEY}",
-        "autoModels": true
+        "apiKey": "{env:MY_PROVIDER_API_KEY}"
       },
       "models": {
         "kimi-k2.7-code-fast": {
@@ -167,7 +166,8 @@ left alone:
 ```
 
 The plugin discovers all other models and merges your metadata on top of the
-discovered defaults.
+discovered defaults. To leave a provider's list exactly as written, set
+`autoModels: false`.
 
 ## Provider options
 
@@ -175,9 +175,9 @@ Set these inside `provider.options`:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `autoModels` | `true` for `@ai-sdk/openai-compatible`, otherwise `false` | Whether to auto-discover models for this provider. `false` disables it; `true` both opts a non-openai-compatible provider in and allows discovery alongside a manual `models` block. |
+| `autoModels` | `true` for `@ai-sdk/openai-compatible`, otherwise `false` | Whether to auto-discover models for this provider. `false` disables it; `true` opts a non-openai-compatible provider in. A manual `models` block does not disable discovery; it is merged on top. |
 | `baseURL` | — | The OpenAI-compatible API base URL (normally ends with `/v1`). |
-| `apiKey` | — | API key used for the `Authorization: Bearer` header. |
+| `apiKey` | — | API key used for the `Authorization: Bearer` header. Falls back to the key stored by `opencode auth login` (see below). |
 | `autoModelsContext` | `128000` | Default context limit for every auto-discovered model of this provider. |
 | `autoModelsOutput` | `16384` | Default output limit for every auto-discovered model of this provider. |
 | `autoModelsInclude` | — | Case-insensitive regex; only matching model IDs are kept. |
@@ -185,9 +185,20 @@ Set these inside `provider.options`:
 | `autoModelsCacheTtl` | inherits `cacheTtl` | Cache lifetime in milliseconds for this provider only. |
 | `modelLimits` | — | Per-provider regex-based model limits (see [Model context limits](#model-context-limits)). |
 
-Both `baseURL` and `apiKey` must be present in the config for a provider to be
-eligible. Credentials stored by `opencode auth login` live in `auth.json` and are
-**not** visible to this plugin, so a provider authenticated that way is skipped.
+A `baseURL` is required. The key used to list models is resolved in this order:
+
+1. `options.apiKey` in the config.
+2. The key stored by `opencode auth login` in opencode's `auth.json`, for the
+   same provider id. The id you picked in `opencode auth login` must match the
+   provider's key under `provider` in `opencode.json`.
+3. No key: the request is sent unauthenticated, which suits local proxies.
+
+`auth.json` is read from `$XDG_DATA_HOME/opencode/auth.json`, otherwise
+`~/.local/share/opencode/auth.json` (`%USERPROFILE%\.local\share\opencode\auth.json`
+on Windows). Override the path with the `authFile` plugin option or the
+`OPENCODE_AUTO_MODELS_AUTH_FILE` environment variable. Only entries of type
+`api` (a plain API key) are used; OAuth entries are logged and ignored. The key
+is never logged and never written to the model cache.
 
 ## Plugin options
 
@@ -219,6 +230,7 @@ If you load the plugin via the `plugin` array, you can pass options:
 | `cacheTtl` | `86400000` | Cache lifetime in milliseconds, 24 hours by default. |
 | `cacheDir` | auto | Override the cache directory. |
 | `refresh` | `false` | Ignore cached entries for this run and refetch everything. |
+| `authFile` | auto | Path to opencode's `auth.json`, used for providers with no `options.apiKey`. |
 
 ## Startup cost
 
@@ -287,8 +299,11 @@ The plugin's `config` hook runs when opencode loads the config. A provider is
 eligible when it:
 
 1. uses `npm: "@ai-sdk/openai-compatible"` (or has `options.autoModels: true`),
-2. has both `options.baseURL` and `options.apiKey`,
-3. has no manual `models` block (or has `options.autoModels: true`).
+2. has `options.baseURL` (the key comes from `options.apiKey`, else `auth.json`, else none),
+3. does not set `options.autoModels: false`.
+
+A manual `models` block does not make a provider ineligible; its entries are
+merged over the discovered ones.
 
 Eligible providers are fetched in parallel and translated from `data[].id` into
 model entries. A provider that fails is logged and left unchanged; the others
