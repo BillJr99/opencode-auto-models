@@ -1,7 +1,7 @@
 {
   "name": "@billjr99/opencode-auto-models",
-  "version": "0.2.0",
-  "description": "OpenCode plugin that auto-discovers models from OpenAI-compatible providers",
+  "version": "0.3.0",
+  "description": "OpenCode v1 and v2 plugin that auto-discovers models from OpenAI-compatible providers",
   "type": "module",
   "main": "src/index.js",
   "exports": {
@@ -38,5 +38,8 @@
   ],
   "devDependencies": {
     "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.0.22"
   }
 }

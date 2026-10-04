@@ -225,17 +225,33 @@ await test("baseURL without a trailing slash still resolves to /models", async (
   assert.match(text, /https:\/\/broken\.example\/v1\/models/);
 });
 
-await test("exports exactly one entry point, shaped for the v1 loader", async () => {
+await test("exports exactly one entry point, carrying both the v1 and v2 halves", async () => {
   const mod = await import("../src/index.js");
   // opencode's v1 loader iterates every export, so a second one registers the
   // hook twice and fetches every provider twice per config load.
   assert.deepEqual(Object.keys(mod), ["default"]);
-  assert.equal(mod.default.id, "auto-models");
+  assert.equal(mod.default.id, "auto-models", "v2 reads id");
   assert.equal(typeof mod.default.server, "function", "v1 reads server()");
-  // v1's PluginModule is { id?, server, tui? } and its loader never looks for
-  // setup(), so carrying one bought nothing and only invited v2 code that
-  // could not run.
-  assert.equal(mod.default.setup, undefined, "no v2 entrypoint");
+  assert.equal(typeof mod.default.setup, "function", "v2 reads setup()");
+});
+
+await test("the v1 path runs without ever touching the v2 one", async () => {
+  // runHook drives server() + the config hook only; a v1 client has no
+  // provider domain, so any reach into the v2 adapter would throw or log it.
+  const { config, text } = await runHook({ provider: { p: provider() } });
+  assert.equal(Object.keys(config.provider.p.models).length, 3);
+  assert.match(text, /Loaded \(v1 entrypoint\)/);
+  assert.doesNotMatch(text, /v2 entrypoint|auto-models:setup/);
+});
+
+await test("server() called without a v1 input warns and still returns working hooks", async () => {
+  const warned = [];
+  console.warn = (...a) => warned.push(a.join(" "));
+  const hooks = await plugin.server(undefined, { cache: false });
+  const config = { provider: { p: provider() } };
+  await hooks.config(config);
+  assert.match(warned.join("\n"), /\[auto-models:server\] Called without an opencode v1 plugin input/);
+  assert.equal(Object.keys(config.provider.p.models).length, 3);
 });
 
 await test("logs a load line even before any provider is examined", async () => {
@@ -598,6 +614,326 @@ await test("a missing or corrupt auth.json does not break discovery", async () =
     assert.equal(Object.keys(bad.config.provider.p.models).length, 3);
     assert.match(bad.text, /Cannot parse .*auth\.json; ignoring it/);
   });
+});
+
+// ─── opencode v2 entrypoint ─────────────────────────────────────────────────
+
+/**
+ * A stand-in for the v2 plugin context. It models what the v2 runtime does to
+ * this plugin, as verified against opencode 2.0.22:
+ *   - `list()` returns Provider.Info for available providers;
+ *   - transforms are replayed from the pre-plugin state on every reload, and
+ *     their callbacks must be synchronous;
+ *   - config providers land after user plugins, signalled by provider.updated.
+ */
+function mockV2({ providers = [], builtIn = {}, options = {}, connections = {} } = {}) {
+  const calls = { reloads: 0, added: [], set: [], replays: 0, promiseFromCallback: false, fetchInCallback: false };
+  let callback = null;
+  let state = new Map();
+
+  const queue = [];
+  let wake = null;
+  let ended = false;
+  const stream = {
+    [Symbol.asyncIterator]() {
+      return {
+        next: async () => {
+          while (queue.length === 0 && !ended) await new Promise((r) => (wake = r));
+          return queue.length ? { value: queue.shift(), done: false } : { value: undefined, done: true };
+        },
+        return: async () => {
+          ended = true;
+          wake?.();
+          return { value: undefined, done: true };
+        },
+      };
+    },
+  };
+
+  function makeEditor(records) {
+    return {
+      list: () => [...records.values()],
+      get: (id) => records.get(id),
+      add: ({ info, models, sourceConnection }) => {
+        if (records.has(info.id)) throw new Error(`duplicate provider ${info.id}`);
+        calls.added.push({ info, models, sourceConnection });
+        records.set(info.id, { provider: info, models: new Map(models.map((m) => [m.id, m])), sourceConnection });
+      },
+      update: () => {},
+      remove: (id) => records.delete(id),
+      models: {
+        set: (id, models) => {
+          calls.set.push({ id, models });
+          const r = records.get(id);
+          records.set(id, { ...r, models: new Map(models.map((m) => [m.id, m])) });
+        },
+        update: () => {},
+        remove: () => {},
+      },
+    };
+  }
+
+  function replay() {
+    if (!callback) return;
+    calls.replays++;
+    const records = new Map(
+      Object.entries(builtIn).map(([id, r]) => [id, { provider: r.info, models: new Map((r.models ?? []).map((m) => [m.id, m])) }])
+    );
+    const before = fetchCount;
+    const result = callback(makeEditor(records));
+    if (result && typeof result.then === "function") calls.promiseFromCallback = true;
+    if (fetchCount !== before) calls.fetchInCallback = true;
+    state = records;
+  }
+
+  const ctx = {
+    options: { cache: false, ...options },
+    provider: {
+      list: async () => ({ location: {}, data: providers }),
+      get: async () => { throw new Error("unused"); },
+      transform: async (cb) => {
+        callback = cb;
+        replay();
+        return { dispose: async () => {} };
+      },
+      reload: async () => {
+        calls.reloads++;
+        replay();
+        // opencode announces its own reloads too; the plugin must not loop on them.
+        queue.push({ type: "provider.updated" });
+        wake?.();
+      },
+    },
+    integration: {
+      connection: {
+        active: async (id) => (connections[id] ? { type: "credential", id: `cred_${id}`, label: "test", method: "key" } : undefined),
+        resolve: async (c) => connections[c.id.slice(5)],
+      },
+    },
+    event: { subscribe: () => stream },
+  };
+
+  return {
+    ctx,
+    calls,
+    state: () => state,
+    models: (id) => [...(state.get(id)?.models.values() ?? [])],
+    emit: (type) => {
+      queue.push({ type });
+      wake?.();
+    },
+    setProviders: (next) => {
+      providers = next;
+    },
+  };
+}
+
+const v2Provider = (id, settings = {}, pkg = "@opencode/ai/providers/openai-compatible") => ({
+  id,
+  name: id,
+  activation: "enabled",
+  package: pkg,
+  settings: { baseURL: "https://api.example.com/v1", ...settings },
+});
+
+/** Runs setup(), waits for discovery, and returns the mock plus captured console output. */
+async function runV2(mockOptions = {}, { after } = {}) {
+  const out = [];
+  console.info = console.warn = console.error = (...a) => out.push(a.map(String).join(" "));
+  const m = mockV2(mockOptions);
+  const cleanup = await plugin.setup(m.ctx);
+  await cleanup.sync();
+  if (after) await after(m, cleanup);
+  await cleanup.settle();
+  await cleanup();
+  return { ...m, cleanup, text: () => out.join("\n") };
+}
+
+const { Model } = await import("@opencode/plugin");
+const { Schema } = await import("effect");
+const decodeModel = Schema.decodeUnknownSync(Model.Info);
+
+await test("v2: setup() logs its load line and discovers a configured provider", async () => {
+  const r = await runV2({ providers: [v2Provider("p", { apiKey: "sk-test" })] });
+  assert.match(r.text(), /\[auto-models:setup\] Loaded \(v2 entrypoint\)/);
+  assert.deepEqual(r.models("p").map((m) => m.id), ["kimi-k2.7-code", "qwen-vl-max", "tiny-1b"]);
+  assert.match(r.text(), /\[auto-models:setup\] Discovered 3 model\(s\) for p/);
+  assert.equal(r.calls.reloads, 1, "one reload publishes the inventory");
+});
+
+await test("v2: translated models are valid Model.Info with limits and capabilities", async () => {
+  const r = await runV2({
+    providers: [v2Provider("p", { autoModelsContext: 64000, modelLimits: [{ pattern: "kimi", context: 262144, output: 32768 }] })],
+    options: { defaultOutput: 8192 },
+  });
+  const byId = Object.fromEntries(r.models("p").map((m) => [m.id, m]));
+  for (const m of Object.values(byId)) decodeModel(m);
+  assert.deepEqual(byId["kimi-k2.7-code"].limit, { context: 262144, output: 32768 }, "provider modelLimits win");
+  assert.deepEqual(byId["tiny-1b"].limit, { context: 64000, output: 8192 }, "provider default, then plugin default");
+  assert.deepEqual(byId["qwen-vl-max"].capabilities, { tools: true, input: ["text", "image"], output: ["text"] });
+  assert.deepEqual(byId["tiny-1b"].capabilities.input, ["text"]);
+  assert.equal(byId["tiny-1b"].providerID, "p");
+  assert.equal(byId["tiny-1b"].modelID, "tiny-1b");
+});
+
+await test("v2: a config provider that lands after setup() is discovered on provider.updated", async () => {
+  const r = await runV2({ providers: [] }, {
+    after: async (m, cleanup) => {
+      assert.equal(m.calls.added.length, 0);
+      m.setProviders([v2Provider("late")]);
+      m.emit("provider.updated");
+      await new Promise((res) => setTimeout(res, 0));
+      await cleanup.sync();
+    },
+  });
+  assert.equal(r.models("late").length, 3);
+});
+
+await test("v2: its own reload does not trigger another discovery", async () => {
+  const r = await runV2({ providers: [v2Provider("p")] }, {
+    after: async (m, cleanup) => {
+      await new Promise((res) => setTimeout(res, 10));
+      await cleanup.sync();
+    },
+  });
+  assert.equal(fetchCount, 1, "the provider.updated raised by reload() is a no-op");
+  assert.equal(r.calls.reloads, 1);
+});
+
+await test("v2: a provider absent from the editor is added once, with info from list()", async () => {
+  const r = await runV2({ providers: [v2Provider("p")] });
+  assert.equal(r.calls.added.length, 1);
+  assert.equal(r.calls.added[0].info.id, "p");
+  assert.equal(r.calls.added[0].info.package, "@opencode/ai/providers/openai-compatible");
+  assert.equal(r.calls.set.length, 0);
+  // Every replay re-adds into a fresh pre-plugin state, never on top of itself.
+  assert.ok(r.calls.replays >= 2);
+});
+
+await test("v2: an existing provider is updated with models.set, keeping its own models", async () => {
+  const manual = { ...Model.Info.default("p", "kimi-k2.7-code"), name: "Kimi (manual)", limit: { context: 1, output: 1 } };
+  const r = await runV2({
+    providers: [v2Provider("p", { autoModels: true })],
+    builtIn: { p: { info: v2Provider("p", { autoModels: true }), models: [manual] } },
+  });
+  assert.equal(r.calls.added.length, 0, "no duplicate provider");
+  assert.ok(r.calls.set.length >= 1);
+  const byId = Object.fromEntries(r.models("p").map((m) => [m.id, m]));
+  assert.deepEqual(Object.keys(byId).sort(), ["kimi-k2.7-code", "qwen-vl-max", "tiny-1b"]);
+  assert.equal(byId["kimi-k2.7-code"].name, "Kimi (manual)", "explicit metadata wins");
+  assert.deepEqual(byId["kimi-k2.7-code"].limit, { context: 1, output: 1 });
+});
+
+await test("v2: opencode's built-in providers are left alone unless autoModels is true", async () => {
+  const r = await runV2({
+    providers: [v2Provider("opencode"), v2Provider("mine")],
+    builtIn: { opencode: { info: v2Provider("opencode") } },
+  });
+  assert.equal(fetchCount, 1);
+  assert.equal(r.models("mine").length, 3);
+  assert.match(r.text(), /Leaving opencode's built-in provider\(s\) alone: opencode/);
+});
+
+await test("v2: include and exclude filters apply", async () => {
+  const r = await runV2({ providers: [v2Provider("p", { autoModelsInclude: "kimi|qwen", autoModelsExclude: "qwen" })] });
+  assert.deepEqual(r.models("p").map((m) => m.id), ["kimi-k2.7-code"]);
+});
+
+await test("v2: every openai-compatible package spelling is eligible; others need autoModels", async () => {
+  const r = await runV2({
+    providers: [
+      v2Provider("a", {}, "@opencode/ai/providers/openai-compatible"),
+      v2Provider("b", {}, "aisdk:@ai-sdk/openai-compatible"),
+      v2Provider("c", {}, "@ai-sdk/openai-compatible"),
+      v2Provider("d", {}, "@opencode/ai/providers/anthropic"),
+      v2Provider("e", { autoModels: true }, "@opencode/ai/providers/anthropic"),
+      v2Provider("f", { autoModels: false }),
+    ],
+  });
+  for (const id of ["a", "b", "c", "e"]) assert.equal(r.models(id).length, 3, id);
+  for (const id of ["d", "f"]) assert.equal(r.models(id).length, 0, id);
+});
+
+await test("v2: one failing provider does not block another", async () => {
+  const r = await runV2({
+    providers: [v2Provider("bad", { baseURL: "https://broken.example/v1" }), v2Provider("good")],
+    options: { retries: 0 },
+  });
+  assert.equal(r.models("good").length, 3);
+  assert.equal(r.models("bad").length, 0);
+  assert.match(r.text(), /Discovery failed for bad at https:\/\/broken\.example\/v1\/models/);
+});
+
+await test("v2: the transform callback is synchronous and does no I/O", async () => {
+  const r = await runV2({ providers: [v2Provider("p")] });
+  assert.ok(r.calls.replays >= 2);
+  assert.equal(r.calls.promiseFromCallback, false);
+  assert.equal(r.calls.fetchInCallback, false);
+});
+
+await test("v2: the active connection's key is used, and no key reaches logs or cache", async () => {
+  const store = memStore();
+  const { seen, result } = await captureHeaders(() =>
+    runV2({
+      providers: [v2Provider("p", { apiKey: "sk-settings-secret" })],
+      connections: { p: { type: "key", key: "sk-connection-secret" } },
+      options: { cache: true, cacheStore: store },
+    })
+  );
+  assert.equal(seen[0].Authorization, "Bearer sk-connection-secret", "v2 prefers the connection, as inference does");
+  assert.doesNotMatch(result.text(), /sk-(settings|connection)-secret/);
+  for (const v of store.map.values()) assert.doesNotMatch(v, /sk-(settings|connection)-secret/);
+  assert.equal(result.calls.added[0].sourceConnection.id, "cred_p", "the inventory is bound to its connection");
+});
+
+await test("v2: settings.apiKey is used when there is no connection; OAuth is named and ignored", async () => {
+  const { seen, result } = await captureHeaders(() =>
+    runV2({
+      providers: [v2Provider("p", { apiKey: "sk-settings" }), v2Provider("o")],
+      connections: { o: { type: "oauth", access: "tok", refresh: "r", expires: 0 } },
+    })
+  );
+  const auth = seen.map((h) => h.Authorization);
+  assert.ok(auth.includes("Bearer sk-settings"));
+  assert.ok(auth.includes(undefined), "the OAuth provider is queried unauthenticated");
+  assert.match(result.text(), /o has an active "oauth" connection, which this plugin cannot use/);
+});
+
+await test("v2: a warm cache serves discovery with the network down", async () => {
+  const store = memStore();
+  await runV2({ providers: [v2Provider("p")], options: { cache: true, cacheStore: store } });
+  fetchImpl = async () => { throw new Error("network on the startup path"); };
+  const r = await runV2({ providers: [v2Provider("p")], options: { cache: true, cacheStore: store } });
+  assert.equal(r.models("p").length, 3);
+  assert.match(r.text(), /Serving p from the cached model list/);
+});
+
+await test("v2: ${NAME} in baseURL is expanded the way opencode expands it", async () => {
+  process.env.AUTO_MODELS_TEST_HOST = "env.example";
+  const urls = [];
+  fetchImpl = async (url) => { urls.push(String(url)); return payload(["m1"]); };
+  try {
+    await runV2({ providers: [v2Provider("p", { baseURL: "https://${AUTO_MODELS_TEST_HOST}/v1" })] });
+  } finally {
+    delete process.env.AUTO_MODELS_TEST_HOST;
+  }
+  assert.deepEqual(urls, ["https://env.example/v1/models"]);
+});
+
+await test("v2: setup() without a provider domain warns and does nothing", async () => {
+  const warned = [];
+  console.warn = (...a) => warned.push(a.join(" "));
+  assert.equal(await plugin.setup({}), undefined);
+  assert.match(warned.join("\n"), /\[auto-models:setup\] Called without an opencode v2 provider domain/);
+  assert.equal(fetchCount, 0);
+});
+
+await test("v2: setup() stays quiet for the v2-beta context opencode 1.18 passes during run", async () => {
+  const said = [];
+  console.warn = console.error = console.info = (...a) => said.push(a.join(" "));
+  assert.equal(await plugin.setup({ options: {}, catalog: {}, agent: {}, aisdk: {} }), undefined);
+  assert.deepEqual(said, []);
+  assert.equal(fetchCount, 0);
 });
 
 // A detached background refresh turns a bug into an unhandled rejection rather
