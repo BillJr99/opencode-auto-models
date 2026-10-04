@@ -1,0 +1,780 @@
+/**
+ * Runtime-agnostic discovery core shared by the opencode v1 and v2 entrypoints
+ * (`./v1.js`, `./v2.js`). Nothing here knows which runtime called it: adapters
+ * hand `discoverAll` a map of `{ npm, options, models }` provider entries and
+ * apply the discovered `{ name, limit, modalities }` model maps themselves.
+ *
+ * Provider options (v1 `provider.<id>.options`, v2 `providers.<id>.settings`):
+ *   autoModels           - enable/disable (default: true for openai-compatible)
+ *   autoModelsContext    - default context limit (default: 128000)
+ *   autoModelsOutput     - default output limit (default: 16384)
+ *   autoModelsInclude    - regex to include only matching model IDs
+ *   autoModelsExclude    - regex to exclude matching model IDs
+ *   autoModelsCacheTtl   - per-provider cache lifetime in ms
+ *   modelLimits          - [{ pattern, context, output }] per-model overrides
+ *
+ * Plugin options:
+ *   timeout              - fetch timeout ms (default: 8000)
+ *   retries              - retry count on failure (default: 1)
+ *   retryDelayMs         - base delay between retries (default: 1000)
+ *   defaultContext       - fallback context limit
+ *   defaultOutput        - fallback output limit
+ *   modelLimits          - global per-model overrides
+ *   dryRun               - log what would be fetched without mutating the config
+ *   cache                - on-disk model-list cache (default: true)
+ *   cacheDir             - override the cache directory
+ *   cacheTtl             - cache lifetime in ms (default: 86400000, 24h)
+ *   refresh              - ignore cached entries for this run
+ *   authFile             - path to opencode's auth.json (default: opencode's data dir)
+ */
+
+const DEFAULT_TIMEOUT_MS = 8000;
+const DEFAULT_RETRIES = 1;
+const DEFAULT_RETRY_DELAY_MS = 1000;
+const DEFAULT_LIMITS = { context: 128000, output: 16384 };
+const DEFAULT_CACHE_TTL_MS = 86_400_000;
+const CACHE_VERSION = 1;
+
+// ─── Logging ────────────────────────────────────────────────────────────────
+
+/**
+ * opencode's TUI surfaces `client.app.log` with --print-logs, but GUI front-ends
+ * (the desktop app) do not. They do capture stdout/stderr into their log file, so
+ * every message is mirrored to the console.
+ *
+ * `client.app.log` is an HTTP round trip to the local opencode server, and the
+ * `config` hook runs on opencode's startup critical path. Awaiting one log call
+ * per provider therefore cost O(providers) sequential round trips before a single
+ * model was fetched. The structured call is now chained onto a queue and never
+ * awaited by the caller: `log()` returns as soon as the synchronous console
+ * mirror is written.
+ *
+ * Chaining rather than firing in parallel keeps messages in order. The only loss
+ * window is a process exit before the queue drains, and the console mirror —
+ * which is what GUI front-ends actually capture — is always already written by
+ * then.
+ */
+function createLogger(client) {
+  let queue = Promise.resolve();
+  // v2 hands plugins no logger at all, and a v1 input without a client is
+  // already wrong; either way the console mirror is the whole log.
+  let transportBroken = typeof client?.app?.log !== "function";
+
+  const log = function log(level, where, message, extra) {
+    const prefixed = `[auto-models:${where}] ${message}`;
+
+    try {
+      const consoleFn = level === "error" ? console.error : level === "warn" ? console.warn : console.info;
+      consoleFn(prefixed, extra ?? "");
+    } catch {
+      // A console that throws must not take the plugin down with it.
+    }
+
+    // One dead transport should produce one line, not one per message.
+    if (transportBroken) return;
+
+    queue = queue
+      .then(() =>
+        client.app.log({
+          body: { service: "auto-models", level, message: prefixed, ...(extra ? { extra } : {}) },
+        })
+      )
+      .catch((e) => {
+        transportBroken = true;
+        try {
+          console.error(
+            `[auto-models:createLogger] client.app.log failed; further structured logs are suppressed: ${errorDetail(e)}`
+          );
+        } catch {
+          // Nothing left to report through.
+        }
+      });
+  };
+
+  /** Drains the queue. Used by tests; never called on the startup path. */
+  log.idle = () => queue;
+
+  return log;
+}
+
+function errorDetail(err) {
+  if (err instanceof Error) return err.stack ?? `${err.name}: ${err.message}`;
+  return String(err);
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function compileLimitRules(rules) {
+  if (!Array.isArray(rules)) return [];
+  return rules.map((r) => ({
+    limits: { context: r.context, output: r.output },
+    pattern: new RegExp(r.pattern, "i"),
+  }));
+}
+
+function inferModelLimits(modelId, rules, defaults) {
+  for (const rule of rules) {
+    if (rule.pattern.test(modelId)) return rule.limits;
+  }
+  return defaults;
+}
+
+function inferModalities(modelId) {
+  const input = ["text"];
+  const output = ["text"];
+
+  if (/(?:^|[-._])(?:vl|vlm|visual)\b|vision|gemma-[34]|llama-[34].*vision|gpt-4o|claude|gemini/i.test(modelId))
+    input.push("image");
+  if (/\baudio\b|gpt-4o-audio|gemini.*audio/i.test(modelId))
+    input.push("audio");
+
+  return { input: [...new Set(input)], output };
+}
+
+/**
+ * An 8s abort timer that is never unref'd holds the event loop open long after
+ * the request it guarded has settled.
+ */
+function unrefTimer(timer) {
+  try {
+    timer?.unref?.();
+  } catch {
+    // A runtime whose timers are plain numbers has nothing to unref.
+  }
+  return timer;
+}
+
+function fetchWithTimeout(url, init, timeoutMs) {
+  const controller = new AbortController();
+  const timer = unrefTimer(setTimeout(() => controller.abort(), timeoutMs));
+  return fetch(url, { ...init, signal: controller.signal }).finally(() =>
+    clearTimeout(timer)
+  );
+}
+
+async function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchModels(url, apiKey, timeoutMs, retries, retryDelayMs) {
+  // A local proxy or self-hosted endpoint often needs no credential at all.
+  // Sending `Authorization: Bearer undefined` to one is worse than sending
+  // nothing, so the header is omitted unless a key was configured.
+  const headers = { Accept: "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, { headers }, timeoutMs);
+
+      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+
+      const body = await response.json();
+      return body?.data ?? [];
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) await sleep(retryDelayMs * (attempt + 1));
+    }
+  }
+  throw lastErr;
+}
+
+// ─── Model-list cache ───────────────────────────────────────────────────────
+
+/**
+ * Without a cache, every opencode start re-fetches every provider's /models
+ * before the model catalog can be built. Discovery cannot simply be detached
+ * instead: opencode awaits the `config` hook and only then reads `cfg.provider`,
+ * so a hook that returns early yields a catalog with no models, and v1 exposes
+ * no way to rebuild it afterwards. The fix is therefore to take the *network*
+ * off the startup path rather than the await — serve startup from disk and
+ * refresh in the background for the next start.
+ *
+ * What is cached is the raw `/models` payload, never the built model map.
+ * Filters, limit rules and modality inference are applied afterwards in
+ * `buildModelMap`, so editing `autoModelsExclude` or `modelLimits` takes effect
+ * on the very next start with no network and no cache bust.
+ */
+
+/** Memoized so N providers trigger one import, not N. */
+let fsModulePromise;
+function loadFs() {
+  if (!fsModulePromise) {
+    // A static import would break the plugin at *load* time on any runtime
+    // without node:fs, which would end the copy-one-file install story. The
+    // rejection is handled here at creation, so it can never surface as an
+    // unhandled rejection even if no caller ever awaits this.
+    fsModulePromise = import("node:fs/promises").then(
+      (m) => m,
+      () => null
+    );
+  }
+  return fsModulePromise;
+}
+
+function readEnv() {
+  return typeof process !== "undefined" && process?.env ? process.env : {};
+}
+
+function readPlatform() {
+  return typeof process !== "undefined" && process ? process.platform : "";
+}
+
+/** FNV-1a, inline, so the file keeps its no-dependency guarantee (no node:crypto). */
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/**
+ * Co-located under opencode's own cache root, so "delete ~/.cache/opencode"
+ * remains the universal reset — the README already points users there for
+ * `packages/`.
+ */
+function resolveCacheDir(options, env, sep) {
+  if (typeof options?.cacheDir === "string" && options.cacheDir) return options.cacheDir;
+  if (env.OPENCODE_AUTO_MODELS_CACHE_DIR) return env.OPENCODE_AUTO_MODELS_CACHE_DIR;
+  if (env.XDG_CACHE_HOME) return [env.XDG_CACHE_HOME, "opencode", "auto-models"].join(sep);
+  // On Windows, opencode itself uses the dot-directory layout rather than
+  // AppData (%USERPROFILE%\.config\opencode\plugins,
+  // %USERPROFILE%\.local\share\opencode\log), so matching it is what keeps
+  // "delete the opencode cache directory" a single instruction on every OS.
+  if (sep === "\\" && env.USERPROFILE) return [env.USERPROFILE, ".cache", "opencode", "auto-models"].join(sep);
+  if (env.HOME) return [env.HOME, ".cache", "opencode", "auto-models"].join(sep);
+  if (env.LOCALAPPDATA) return [env.LOCALAPPDATA, "opencode", "auto-models"].join(sep);
+  return null;
+}
+
+/**
+ * `opencode auth login` stores credentials in `<data>/opencode/auth.json`, keyed
+ * by provider id, rather than in the config the `config` hook receives. opencode
+ * resolves its data directory through xdg-basedir, which falls back to
+ * ~/.local/share on every OS — including Windows — so the same dot-directory
+ * layout as the cache applies.
+ */
+function resolveAuthFile(options, env, sep) {
+  if (typeof options?.authFile === "string" && options.authFile) return options.authFile;
+  if (env.OPENCODE_AUTO_MODELS_AUTH_FILE) return env.OPENCODE_AUTO_MODELS_AUTH_FILE;
+  if (env.XDG_DATA_HOME) return [env.XDG_DATA_HOME, "opencode", "auth.json"].join(sep);
+  if (sep === "\\" && env.USERPROFILE) return [env.USERPROFILE, ".local", "share", "opencode", "auth.json"].join(sep);
+  if (env.HOME) return [env.HOME, ".local", "share", "opencode", "auth.json"].join(sep);
+  return null;
+}
+
+/**
+ * Returns Map(providerId -> { type, key }). Every failure — no fs, no file, bad
+ * JSON — is just an empty map: auth.json is a fallback, and its absence must
+ * never fail discovery. Key material is never logged.
+ */
+async function loadAuthEntries(settings, log) {
+  const entries = new Map();
+
+  const add = (raw) => {
+    if (!raw || typeof raw !== "object") return;
+    for (const [id, entry] of Object.entries(raw)) {
+      if (typeof entry === "string") entries.set(id, { type: "api", key: entry });
+      else if (entry && typeof entry === "object") entries.set(id, { type: entry.type, key: entry.key });
+    }
+  };
+
+  if (settings.authKeys) {
+    add(settings.authKeys);
+    return entries;
+  }
+  if (!settings.authFile) return entries;
+
+  const fs = await loadFs();
+  if (!fs) return entries;
+
+  let text;
+  try {
+    text = await fs.readFile(settings.authFile, "utf8");
+  } catch {
+    log("info", "loadAuthEntries", `No opencode credential file at ${settings.authFile}; using options.apiKey only`);
+    return entries;
+  }
+
+  try {
+    add(JSON.parse(text));
+  } catch (e) {
+    log("warn", "loadAuthEntries", `Cannot parse ${settings.authFile}; ignoring it: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return entries;
+}
+
+/**
+ * Provider ids come from user config, so an id of `../../../etc` must not be
+ * able to escape the cache directory. The slug is also what makes the directory
+ * legible to a human running `ls`.
+ */
+function slugifyProviderId(providerId) {
+  return (
+    String(providerId)
+      .replace(/[^A-Za-z0-9._-]/g, "_")
+      // Collapse dot runs and strip leading punctuation so the result cannot be
+      // `..`, a dotfile, or anything else a shell or a glob treats specially.
+      .replace(/\.{2,}/g, "_")
+      .replace(/^[._-]+/, "")
+      .slice(0, 40) || "provider"
+  );
+}
+
+/**
+ * Keyed on the resolved URL and on a fingerprint of the credential, because
+ * rotating to a different account's key can legitimately change the model list
+ * and a plain "keyed/anon" bit would serve the old account's models for a whole
+ * TTL. The fingerprint only ever feeds this filename; no credential material is
+ * written into the cache file.
+ */
+function cacheKeyFor(providerId, url, apiKey) {
+  return `${slugifyProviderId(providerId)}.${fnv1a(`${url} ${apiKey ? fnv1a(apiKey) : "anon"}`)}`;
+}
+
+function createNullStore() {
+  return { dir: null, async read() { return null; }, async write() {} };
+}
+
+function createFsStore(dir, sep, log) {
+  let writable = true;
+  let ensured = null;
+  const pathFor = (key) => `${dir}${sep}${key}.json`;
+
+  return {
+    dir,
+    async read(key) {
+      const fs = await loadFs();
+      if (!fs) return null;
+      try {
+        return await fs.readFile(pathFor(key), "utf8");
+      } catch {
+        // A missing file, an unreadable directory and a runtime without fs are
+        // all just a cache miss.
+        return null;
+      }
+    },
+    async write(key, text) {
+      if (!writable) return;
+      const fs = await loadFs();
+      if (!fs) {
+        writable = false;
+        return;
+      }
+
+      const target = pathFor(key);
+      const tmp = `${target}.${Math.random().toString(36).slice(2)}.tmp`;
+
+      try {
+        if (!ensured) ensured = fs.mkdir(dir, { recursive: true, mode: 0o700 });
+        await ensured;
+        await fs.writeFile(tmp, text, { mode: 0o600 });
+        // Atomic on POSIX, and replace-semantics on Windows, so a second
+        // opencode instance can never observe a half-written file.
+        await fs.rename(tmp, target);
+      } catch (e) {
+        writable = false;
+        ensured = null;
+        log("warn", "createFsStore", `Cannot write the model cache at ${dir}; continuing without it: ${errorDetail(e)}`);
+        try {
+          await fs.unlink(tmp);
+        } catch {
+          // The temp file may never have been created.
+        }
+      }
+    },
+  };
+}
+
+function serializeEntry(task, data, now) {
+  return JSON.stringify({
+    v: CACHE_VERSION,
+    providerId: task.providerId,
+    url: task.url,
+    keyed: !!task.apiKey,
+    savedAt: now,
+    data,
+  });
+}
+
+/** Anything unparseable, versioned differently or written for another URL is a miss. */
+function readEntry(text, task, now) {
+  if (typeof text !== "string") return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+
+  if (!parsed || parsed.v !== CACHE_VERSION) return null;
+  if (parsed.providerId !== task.providerId || parsed.url !== task.url) return null;
+  if (!Array.isArray(parsed.data)) return null;
+
+  const savedAt = typeof parsed.savedAt === "number" ? parsed.savedAt : 0;
+  // A savedAt in the future — clock skew, a resumed VM — must never read as
+  // fresh, or a bad clock pins the entry forever.
+  const age = savedAt > now ? Infinity : now - savedAt;
+
+  return { data: parsed.data, savedAt, age };
+}
+
+// ─── Discovery core (runtime-agnostic) ──────────────────────────────────────
+
+/**
+ * Decide which providers are eligible, and say out loud why the rest are not.
+ * Every skip here used to be a silent `continue`, which made a non-working
+ * plugin indistinguishable from a working one on any GUI front-end.
+ */
+function collectProviderTasks(providers, settings, log, authEntries = new Map()) {
+  const tasks = [];
+
+  for (const [providerId, provider] of Object.entries(providers)) {
+    if (!provider || typeof provider !== "object") {
+      log("warn", "collectProviderTasks", `Skipping ${providerId}: provider entry is not an object`);
+      continue;
+    }
+
+    const opts = provider.options ?? {};
+    const { baseURL } = opts;
+    let apiKey = opts.apiKey;
+
+    if (!baseURL) {
+      log(
+        "info",
+        "collectProviderTasks",
+        `Skipping ${providerId}: no options.baseURL, so there is no /models endpoint to query.`
+      );
+      continue;
+    }
+
+    if (!apiKey) {
+      // Not a skip: unauthenticated endpoints are a normal case. But a provider
+      // set up with `opencode auth login` keeps its key in auth.json, not here.
+      const stored = authEntries.get(providerId);
+      if (stored && stored.type === "api" && typeof stored.key === "string" && stored.key) {
+        apiKey = stored.key;
+        log(
+          "info",
+          "collectProviderTasks",
+          `${providerId} has no options.apiKey; using the credential stored by \`opencode auth login\` (auth.json)`
+        );
+      } else if (stored) {
+        log(
+          "warn",
+          "collectProviderTasks",
+          `${providerId} has an auth.json entry of type ${JSON.stringify(stored.type)}, which this plugin cannot use; ` +
+            `querying ${baseURL} unauthenticated. Set options.apiKey if this endpoint needs a key.`
+        );
+      } else {
+        log(
+          "info",
+          "collectProviderTasks",
+          `${providerId} has no options.apiKey and no auth.json entry; querying ${baseURL} unauthenticated. ` +
+            `Set options.apiKey or run \`opencode auth login\` if this endpoint needs a key.`
+        );
+      }
+    }
+
+    const isOpenAICompatible = provider.npm === "@ai-sdk/openai-compatible";
+    const autoModelsFlag = opts.autoModels;
+
+    if (autoModelsFlag === false) {
+      log("info", "collectProviderTasks", `Skipping ${providerId}: options.autoModels is false`);
+      continue;
+    }
+
+    if (!isOpenAICompatible && autoModelsFlag !== true) {
+      log(
+        "info",
+        "collectProviderTasks",
+        `Skipping ${providerId}: npm is ${JSON.stringify(provider.npm)}, not "@ai-sdk/openai-compatible". ` +
+          `Set options.autoModels: true to opt in anyway.`
+      );
+      continue;
+    }
+
+    // A manual models block no longer opts a provider out: discovered models are
+    // added alongside it, and the manual entries are merged on top as overrides.
+    const existingModels = provider.models;
+    if (existingModels && Object.keys(existingModels).length > 0) {
+      log(
+        "info",
+        "collectProviderTasks",
+        `${providerId} already defines ${Object.keys(existingModels).length} model(s) manually; ` +
+          `discovering the rest and keeping those entries as overrides`
+      );
+    }
+
+    const includeFilter = opts.autoModelsInclude ? new RegExp(opts.autoModelsInclude, "i") : null;
+    const excludeFilter = opts.autoModelsExclude ? new RegExp(opts.autoModelsExclude, "i") : null;
+
+    const providerDefaults = {
+      context: typeof opts.autoModelsContext === "number" ? opts.autoModelsContext : settings.defaults.context,
+      output: typeof opts.autoModelsOutput === "number" ? opts.autoModelsOutput : settings.defaults.output,
+    };
+
+    const limitRules = [...compileLimitRules(opts.modelLimits), ...settings.globalRules];
+    const url = new URL("models", baseURL.endsWith("/") ? baseURL : `${baseURL}/`).toString();
+    const cacheTtlMs = typeof opts.autoModelsCacheTtl === "number" ? opts.autoModelsCacheTtl : settings.cacheTtlMs;
+
+    tasks.push({
+      providerId,
+      provider,
+      url,
+      apiKey,
+      existingModels,
+      includeFilter,
+      excludeFilter,
+      providerDefaults,
+      limitRules,
+      cacheTtlMs,
+      cacheKey: cacheKeyFor(providerId, url, apiKey),
+    });
+  }
+
+  return tasks;
+}
+
+/** Turn a provider's /models payload into an opencode `models` map. */
+function buildModelMap(task, data) {
+  const discovered = {};
+
+  for (const model of data) {
+    const id = model.id;
+    if (!id) continue;
+    if (task.includeFilter && !task.includeFilter.test(id)) continue;
+    if (task.excludeFilter && task.excludeFilter.test(id)) continue;
+
+    discovered[id] = {
+      name: model.name || id,
+      limit: inferModelLimits(id, task.limitRules, task.providerDefaults),
+      modalities: inferModalities(id),
+    };
+  }
+
+  return discovered;
+}
+
+async function fetchAndCache(task, settings) {
+  const data = await fetchModels(task.url, task.apiKey, settings.timeoutMs, settings.retries, settings.retryDelayMs);
+  // Only a successful response is written. Caching a failure as `[]` would make
+  // a transient outage sticky for a whole TTL and indistinguishable from a
+  // provider that genuinely serves no models.
+  try {
+    await settings.store.write(task.cacheKey, serializeEntry(task, data, settings.now()));
+  } catch {
+    // Writing is best effort: the cache is an optimisation and must never be
+    // able to fail a discovery that already succeeded.
+  }
+  return data;
+}
+
+/**
+ * Warm the cache for the NEXT start. Deliberately detached, and deliberately
+ * limited to the cache: by the time this resolves, opencode has already read
+ * `cfg.provider` and built its model catalog, so mutating the config here would
+ * advertise models the catalog does not contain.
+ *
+ * The per-settings guard matters because the `config` hook is not once per
+ * process — opencode re-runs it on every config reload, and without this a few
+ * edits to opencode.json would fan out a refresh per provider per edit.
+ */
+function scheduleRefresh(task, settings, log) {
+  if (settings.refreshed.has(task.cacheKey)) return;
+  settings.refreshed.add(task.cacheKey);
+
+  settings.background.push(
+    fetchAndCache(task, settings).then(
+      (data) =>
+        log(
+          "info",
+          "scheduleRefresh",
+          `Refreshed the cached model list for ${task.providerId} (${data.length} model(s)) for the next start`
+        ),
+      (e) => log("warn", "scheduleRefresh", `Background refresh failed for ${task.providerId}: ${errorDetail(e)}`)
+    )
+  );
+}
+
+/**
+ * Stale-while-revalidate, per provider:
+ *   fresh  -> serve from disk, no blocking network, refresh in the background
+ *   stale  -> fetch; on failure fall back to the stale copy rather than leaving
+ *             the provider empty when a usable answer is already on disk
+ *   miss   -> fetch (exactly today's behavior)
+ */
+/** Reading is best effort too, so an injected or broken store cannot fail discovery. */
+async function readCached(task, settings) {
+  if (!settings.cache || settings.refresh) return null;
+  try {
+    return readEntry(await settings.store.read(task.cacheKey), task, settings.now());
+  } catch {
+    return null;
+  }
+}
+
+/** `age` is Infinity for a future-dated entry, which must not reach a log line. */
+function describeAge(age) {
+  return Number.isFinite(age) ? `${Math.round(age / 1000)}s old` : "dated in the future";
+}
+
+async function resolveTaskData(task, settings, log) {
+  const entry = await readCached(task, settings);
+
+  if (entry && entry.age <= task.cacheTtlMs) {
+    log(
+      "info",
+      "resolveTaskData",
+      `Serving ${task.providerId} from the cached model list (${task.cacheKey}, ${entry.data.length} model(s), ` +
+        `${describeAge(entry.age)}); refreshing in the background for the next start`
+    );
+    scheduleRefresh(task, settings, log);
+    return entry.data;
+  }
+
+  if (!entry) return fetchAndCache(task, settings);
+
+  try {
+    return await fetchAndCache(task, settings);
+  } catch (e) {
+    log(
+      "warn",
+      "resolveTaskData",
+      `Refresh failed for ${task.providerId}; falling back to the expired cached list ` +
+        `(${entry.data.length} model(s), ${describeAge(entry.age)}): ${errorDetail(e)}`
+    );
+    return entry.data;
+  }
+}
+
+/**
+ * Fetch every eligible provider in parallel and return the discovered model maps.
+ * Runtime-agnostic on purpose: callers decide how to apply the result, so the
+ * same core serves the v1 `config` hook and the v2 provider transform.
+ */
+async function discoverAll(providers, settings, log) {
+  const authEntries = await loadAuthEntries(settings, log);
+  const tasks = collectProviderTasks(providers, settings, log, authEntries);
+
+  if (tasks.length === 0) {
+    log("info", "discoverAll", "No eligible providers for auto-discovery");
+    return [];
+  }
+
+  if (settings.dryRun) {
+    for (const task of tasks) {
+      const entry = await readCached(task, settings);
+
+      if (entry && entry.age <= task.cacheTtlMs) {
+        log(
+          "info",
+          "discoverAll",
+          `[dry-run] Would serve ${task.providerId} from the cached model list ` +
+            `(${entry.data.length} model(s), ${describeAge(entry.age)}) and refresh it in the background`
+        );
+      } else {
+        log("info", "discoverAll", `[dry-run] Would fetch models for ${task.providerId} from ${task.url}`);
+      }
+    }
+    return [];
+  }
+
+  log("info", "discoverAll", `Discovering models for ${tasks.length} provider(s): ${tasks.map((t) => t.providerId).join(", ")}`);
+
+  const results = await Promise.allSettled(tasks.map((t) => resolveTaskData(t, settings, log)));
+
+  const discoveries = [];
+
+  // Index-carrying loop: recovering the task via results.indexOf(result) was
+  // O(n^2) and relied on allSettled returning reference-distinct objects, so a
+  // failure could in principle be attributed to the wrong provider.
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    const task = tasks[i];
+
+    if (result.status === "rejected") {
+      log("error", "discoverAll", `Discovery failed for ${task.providerId} at ${task.url}: ${errorDetail(result.reason)}`);
+      continue;
+    }
+
+    const discovered = buildModelMap(task, result.value);
+
+    if (Object.keys(discovered).length === 0) {
+      log("warn", "discoverAll", `No models discovered for ${task.providerId} at ${task.url}`);
+      continue;
+    }
+
+    discoveries.push({ task, discovered });
+  }
+
+  return discoveries;
+}
+
+/** Discovered defaults first, the user's manual metadata merged on top. */
+function mergeWithManual(discovered, existingModels) {
+  const merged = { ...discovered };
+  if (!existingModels) return merged;
+
+  for (const [id, manual] of Object.entries(existingModels)) {
+    merged[id] = { ...discovered[id], ...manual };
+  }
+  return merged;
+}
+
+function resolveSettings(options, log) {
+  const env = readEnv();
+  const sep = readPlatform() === "win32" ? "\\" : "/";
+
+  // `cache: false` must not merely skip reads: an injected store would still be
+  // written through, so disabling the cache swaps the store out entirely.
+  const cacheEnabled = options?.cache !== false;
+  const dir = cacheEnabled ? resolveCacheDir(options, env, sep) : null;
+  const store = cacheEnabled ? options?.cacheStore ?? (dir ? createFsStore(dir, sep, log) : createNullStore()) : createNullStore();
+  const cache = cacheEnabled && (!!options?.cacheStore || !!dir);
+
+  return {
+    dryRun: options?.dryRun === true,
+    timeoutMs: typeof options?.timeout === "number" ? options.timeout : DEFAULT_TIMEOUT_MS,
+    retries: typeof options?.retries === "number" ? options.retries : DEFAULT_RETRIES,
+    retryDelayMs: typeof options?.retryDelayMs === "number" ? options.retryDelayMs : DEFAULT_RETRY_DELAY_MS,
+    defaults: {
+      context: typeof options?.defaultContext === "number" ? options.defaultContext : DEFAULT_LIMITS.context,
+      output: typeof options?.defaultOutput === "number" ? options.defaultOutput : DEFAULT_LIMITS.output,
+    },
+    globalRules: compileLimitRules(options?.modelLimits),
+    cache,
+    cacheTtlMs: typeof options?.cacheTtl === "number" ? options.cacheTtl : DEFAULT_CACHE_TTL_MS,
+    refresh: options?.refresh === true || env.OPENCODE_AUTO_MODELS_REFRESH === "1",
+    authFile: resolveAuthFile(options, env, sep),
+    // Test seam, like cacheStore: { providerId: "key" | { type, key } }.
+    authKeys: options?.authKeys && typeof options.authKeys === "object" ? options.authKeys : null,
+    store,
+    now: typeof options?.now === "function" ? options.now : Date.now,
+    // Scoped per plugin instance rather than module-wide, so a config reload
+    // reuses the guard while a fresh instance starts clean.
+    refreshed: new Set(),
+    background: [],
+  };
+}
+
+/** Awaits every detached refresh and drains the log queue. Used by tests. */
+async function settleBackground(settings, log) {
+  while (settings.background.length > 0) {
+    await Promise.allSettled(settings.background.splice(0));
+  }
+  await log.idle();
+}
+
+export {
+  createLogger,
+  discoverAll,
+  errorDetail,
+  mergeWithManual,
+  resolveSettings,
+  settleBackground,
+};

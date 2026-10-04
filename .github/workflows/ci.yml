@@ -27,6 +27,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
+      # The v2 entrypoint imports @opencode/plugin, so the suite needs it installed.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
       - name: Run tests
         run: node test/run.mjs
 
@@ -40,7 +44,7 @@ jobs:
         with:
           node-version: 22
 
-      # tsconfig.json checks src/**/*.js, and typescript is the only devDependency.
+      # tsconfig.json checks src/**/*.js; the v2 files are @ts-check against @opencode/plugin's types.
       - name: Install devDependencies
         run: npm install --no-audit --no-fund
 
