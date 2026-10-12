@@ -804,8 +804,8 @@ async function resolveTaskData(task, settings, log) {
 
 /**
  * Fetch every eligible provider in parallel and return the discovered model maps.
- * Never rejects on a provider's account. Providers that were unreachable are
- * added to the optional `unavailable` set, so a caller that can keep serving
+ * Never rejects on a provider's account. Providers that were unreachable, or
+ * answered with an HTTP 4xx, are added to the optional `unavailable` set, so a caller that can keep serving
  * a last-known inventory (v2) can tell "down" from "serves no models".
  * Runtime-agnostic on purpose: callers decide how to apply the result, so the
  * same core serves the v1 `config` hook and the v2 provider transform.
@@ -858,7 +858,9 @@ async function discoverAll(providers, settings, log, { unavailable } = {}) {
         log("warn", "discoverAll", `Skipping ${task.providerId}: ${task.url} is unreachable (${reason}); continuing without its models`);
       } else if (isHttpClientError(result.reason)) {
         // A 4xx (bad key, wrong path) is worth a clear line but is no more fatal
-        // than an outage: the other providers carry on either way.
+        // than an outage: the other providers carry on, and a runtime that can
+        // keep a last-known inventory keeps it here too.
+        unavailable?.add(task.providerId);
         log("warn", "discoverAll", `Skipping ${task.providerId}: ${task.url} returned ${reason}; continuing without its models`);
       } else {
         log("error", "discoverAll", `Discovery failed for ${task.providerId} at ${task.url}: ${reason}`);

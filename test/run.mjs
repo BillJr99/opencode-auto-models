@@ -1048,7 +1048,26 @@ await test("v2: a provider that goes down keeps its last published inventory acr
   assert.equal(r.models("p").length, 3, "the unreachable provider did not vanish on reload");
   assert.equal(r.calls.reloads, 2);
   assert.match(r.text(), /WARN \[auto-models:discoverAll\] Skipping p: .* is unreachable \(connection refused/);
-  assert.match(r.text(), /Keeping 3 last-known model\(s\) for p while it is unreachable/);
+  assert.match(r.text(), /Keeping 3 last-known model\(s\) for p while its \/models is unavailable/);
+  assert.doesNotMatch(r.text(), /ERROR /);
+});
+
+await test("v2: a provider that starts answering 4xx also keeps its last published inventory", async () => {
+  const p = v2Provider("p", { baseURL: "https://flaky.example/v1" });
+  const r = await runV2({ providers: [p], options: { retries: 0 } }, {
+    after: async (m, cleanup) => {
+      assert.equal(m.models("p").length, 3, "published while healthy");
+      fetchImpl = async (url) =>
+        String(url).includes("flaky.example") ? { ok: false, status: 401, statusText: "Unauthorized" } : defaultFetch(url);
+      m.setProviders([p, v2Provider("q")]);
+      m.emit("provider.updated");
+      await cleanup.sync();
+    },
+  });
+  assert.equal(r.models("q").length, 3);
+  assert.equal(r.models("p").length, 3, "a 4xx does not drop the last-known models");
+  assert.match(r.text(), /WARN \[auto-models:discoverAll\] Skipping p: .* returned HTTP 401 Unauthorized/);
+  assert.match(r.text(), /Keeping 3 last-known model\(s\) for p/);
   assert.doesNotMatch(r.text(), /ERROR /);
 });
 

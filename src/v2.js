@@ -299,7 +299,7 @@ export async function setupV2(ctx) {
       });
     }
 
-    // A provider that is only temporarily down keeps what it last published:
+    // A provider that is down, or refusing /models (a 4xx), keeps what it last published:
     // the reload another provider triggers must not make its models vanish.
     // One that left the config, or answered with no models, still drops out.
     for (const providerID of unavailable) {
@@ -307,7 +307,7 @@ export async function setupV2(ctx) {
       const entry = infos.get(providerID);
       if (!previous || !entry || nextCaptured.has(providerID)) continue;
       nextCaptured.set(providerID, { info: entry.info, models: previous.models, connection: entry.connection });
-      log("info", "setup", `Keeping ${previous.models.length} last-known model(s) for ${providerID} while it is unreachable`);
+      log("info", "setup", `Keeping ${previous.models.length} last-known model(s) for ${providerID} while its /models is unavailable`);
     }
 
     const changed = JSON.stringify([...nextCaptured]) !== JSON.stringify([...captured]);
