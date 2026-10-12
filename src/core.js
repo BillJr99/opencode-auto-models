@@ -24,6 +24,8 @@
  *   cache                - on-disk model-list cache (default: true)
  *   cacheDir             - override the cache directory
  *   cacheTtl             - cache lifetime in ms (default: 86400000, 24h)
+ *   awaitExpired         - refetch an expired entry before startup continues
+ *                          instead of serving it and refreshing in the background
  *   refresh              - ignore cached entries for this run
  *   authFile             - path to opencode's auth.json (default: opencode's data dir)
  */
@@ -189,7 +191,7 @@ async function fetchModels(url, apiKey, timeoutMs, retries, retryDelayMs) {
  * so a hook that returns early yields a catalog with no models, and v1 exposes
  * no way to rebuild it afterwards. The fix is therefore to take the *network*
  * off the startup path rather than the await — serve startup from disk and
- * refresh in the background for the next start.
+ * refresh in the background, for the next start on v1 and live on v2.
  *
  * What is cached is the raw `/models` payload, never the built model map.
  * Filters, limit rules and modality inference are applied afterwards in
@@ -575,27 +577,43 @@ async function fetchAndCache(task, settings) {
 }
 
 /**
- * Warm the cache for the NEXT start. Deliberately detached, and deliberately
- * limited to the cache: by the time this resolves, opencode has already read
- * `cfg.provider` and built its model catalog, so mutating the config here would
- * advertise models the catalog does not contain.
+ * Refresh a served cache entry off the startup path. Deliberately detached: the
+ * caller has already handed the cached list to opencode.
+ *
+ * On v1 this can only warm the cache for the NEXT start: by the time it
+ * resolves, opencode has already read `cfg.provider` and built its model
+ * catalog, so mutating the config here would advertise models the catalog does
+ * not contain. A runtime that can rebuild its inventory (v2) sets
+ * `settings.onRefresh`, which is called when the refreshed list differs from
+ * the one that was served, so the change can be applied live.
  *
  * The per-settings guard matters because the `config` hook is not once per
  * process — opencode re-runs it on every config reload, and without this a few
- * edits to opencode.json would fan out a refresh per provider per edit.
+ * edits to opencode.json would fan out a refresh per provider per edit. It also
+ * stops the live re-apply from triggering another refresh of its own.
  */
-function scheduleRefresh(task, settings, log) {
+function scheduleRefresh(task, settings, log, served) {
   if (settings.refreshed.has(task.cacheKey)) return;
   settings.refreshed.add(task.cacheKey);
 
   settings.background.push(
     fetchAndCache(task, settings).then(
-      (data) =>
+      (data) => {
+        const changed = JSON.stringify(data) !== JSON.stringify(served);
+        const live = changed && typeof settings.onRefresh === "function";
         log(
           "info",
           "scheduleRefresh",
-          `Refreshed the cached model list for ${task.providerId} (${data.length} model(s)) for the next start`
-        ),
+          `Refreshed the cached model list for ${task.providerId} (${data.length} model(s)); ` +
+            (!changed ? "unchanged" : live ? "applying it now" : "it takes effect on the next start")
+        );
+        if (!live) return;
+        try {
+          settings.onRefresh(task, data);
+        } catch (e) {
+          log("warn", "scheduleRefresh", `Could not apply the refreshed list for ${task.providerId}: ${errorDetail(e)}`);
+        }
+      },
       (e) => log("warn", "scheduleRefresh", `Background refresh failed for ${task.providerId}: ${errorDetail(e)}`)
     )
   );
@@ -603,10 +621,12 @@ function scheduleRefresh(task, settings, log) {
 
 /**
  * Stale-while-revalidate, per provider:
- *   fresh  -> serve from disk, no blocking network, refresh in the background
- *   stale  -> fetch; on failure fall back to the stale copy rather than leaving
- *             the provider empty when a usable answer is already on disk
- *   miss   -> fetch (exactly today's behavior)
+ *   cached -> serve from disk with no blocking network, whether fresh or
+ *             expired, and refresh in the background
+ *   expired, with awaitExpired, or dated in the future
+ *          -> fetch; on failure fall back to the cached copy rather than
+ *             leaving the provider empty when a usable answer is already on disk
+ *   miss   -> fetch, and write the cache
  */
 /** Reading is best effort too, so an injected or broken store cannot fail discovery. */
 async function readCached(task, settings) {
@@ -623,17 +643,25 @@ function describeAge(age) {
   return Number.isFinite(age) ? `${Math.round(age / 1000)}s old` : "dated in the future";
 }
 
+/** Whether a cached entry may be served without waiting for the network. */
+function servable(entry, task, settings) {
+  if (entry.age <= task.cacheTtlMs) return true;
+  // A future-dated entry has an unknown age, so it is never served blind.
+  return !settings.awaitExpired && Number.isFinite(entry.age);
+}
+
 async function resolveTaskData(task, settings, log) {
   const entry = await readCached(task, settings);
 
-  if (entry && entry.age <= task.cacheTtlMs) {
+  if (entry && servable(entry, task, settings)) {
+    const expired = entry.age > task.cacheTtlMs;
     log(
       "info",
       "resolveTaskData",
-      `Serving ${task.providerId} from the cached model list (${task.cacheKey}, ${entry.data.length} model(s), ` +
-        `${describeAge(entry.age)}); refreshing in the background for the next start`
+      `Serving ${task.providerId} from the ${expired ? "expired " : ""}cached model list ` +
+        `(${task.cacheKey}, ${entry.data.length} model(s), ${describeAge(entry.age)}); refreshing in the background`
     );
-    scheduleRefresh(task, settings, log);
+    scheduleRefresh(task, settings, log, entry.data);
     return entry.data;
   }
 
@@ -670,7 +698,7 @@ async function discoverAll(providers, settings, log) {
     for (const task of tasks) {
       const entry = await readCached(task, settings);
 
-      if (entry && entry.age <= task.cacheTtlMs) {
+      if (entry && servable(entry, task, settings)) {
         log(
           "info",
           "discoverAll",
@@ -749,6 +777,7 @@ function resolveSettings(options, log) {
     globalRules: compileLimitRules(options?.modelLimits),
     cache,
     cacheTtlMs: typeof options?.cacheTtl === "number" ? options.cacheTtl : DEFAULT_CACHE_TTL_MS,
+    awaitExpired: options?.awaitExpired === true,
     refresh: options?.refresh === true || env.OPENCODE_AUTO_MODELS_REFRESH === "1",
     authFile: resolveAuthFile(options, env, sep),
     // Test seam, like cacheStore: { providerId: "key" | { type, key } }.
@@ -759,6 +788,9 @@ function resolveSettings(options, log) {
     // reuses the guard while a fresh instance starts clean.
     refreshed: new Set(),
     background: [],
+    // Set by a runtime that can apply a background refresh live (v2).
+    /** @type {((task: any, data: any[]) => void) | null} */
+    onRefresh: null,
   };
 }
 
