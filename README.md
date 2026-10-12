@@ -364,8 +364,8 @@ The options are the same on both versions:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `timeout` | `8000` | Request timeout in milliseconds for `GET /models`. |
-| `retries` | `1` | Retry attempts after an initial failure. |
+| `timeout` | `8000` | Request timeout in milliseconds for `GET /models`. A provider that times out, refuses the connection or cannot be resolved is skipped with one warning and never blocks the others. |
+| `retries` | `1` | Retry attempts after a transient failure (5xx, dropped socket). A timeout is not retried, so a hung host costs one `timeout`, not one per attempt. |
 | `retryDelayMs` | `1000` | Base delay between retries; backs off linearly. |
 | `dryRun` | `false` | Log what would be fetched without changing any models. |
 | `defaultContext` | `128000` | Fallback context limit for auto-discovered models. |

@@ -146,12 +146,26 @@ function unrefTimer(timer) {
   return timer;
 }
 
+/**
+ * Our own abort surfaces from fetch as a bare `AbortError` whose stack reads
+ * `abort@[native code]`, which says nothing about why. It is rethrown as a
+ * named TimeoutError so callers can tell it apart and log it legibly.
+ */
 function fetchWithTimeout(url, init, timeoutMs) {
   const controller = new AbortController();
-  const timer = unrefTimer(setTimeout(() => controller.abort(), timeoutMs));
-  return fetch(url, { ...init, signal: controller.signal }).finally(() =>
-    clearTimeout(timer)
+  let timedOut = false;
+  const timer = unrefTimer(
+    setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs)
   );
+  return fetch(url, { ...init, signal: controller.signal })
+    .catch((cause) => {
+      if (!timedOut) throw cause;
+      throw Object.assign(new Error(`timed out after ${timeoutMs}ms`), { name: "TimeoutError", timeoutMs, cause });
+    })
+    .finally(() => clearTimeout(timer));
 }
 
 async function sleep(ms) {
@@ -170,16 +184,107 @@ async function fetchModels(url, apiKey, timeoutMs, retries, retryDelayMs) {
     try {
       const response = await fetchWithTimeout(url, { headers }, timeoutMs);
 
-      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      if (!response.ok) {
+        throw Object.assign(new Error(`HTTP ${response.status} ${response.statusText}`), { status: response.status });
+      }
 
       const body = await response.json();
       return body?.data ?? [];
     } catch (err) {
       lastErr = err;
+      // A timeout already spent the whole budget and is not transient: a host
+      // that hangs once hangs again, so retrying only doubles the startup stall.
+      if (err?.name === "TimeoutError") break;
       if (attempt < retries) await sleep(retryDelayMs * (attempt + 1));
     }
   }
   throw lastErr;
+}
+
+// ─── Fetch-error classification ─────────────────────────────────────────────
+
+const TIMEOUT_CODES = ["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT"];
+const DNS_CODES = ["ENOTFOUND", "EAI_AGAIN"];
+const CLOSED_CODES = ["UND_ERR_SOCKET", "ECONNRESET", "EPIPE", "UND_ERR_CLOSED"];
+
+/**
+ * Node's fetch wraps the real cause: `TypeError: fetch failed` whose `cause`
+ * carries the code, and for a multi-address host an AggregateError of them.
+ * Every layer is examined so the most specific one wins.
+ */
+function errorLayers(err) {
+  const layers = [];
+  const visit = (e, depth) => {
+    if (!e || depth > 4 || layers.includes(e)) return;
+    layers.push(e);
+    if (Array.isArray(e.errors)) for (const inner of e.errors) visit(inner, depth + 1);
+    visit(e.cause, depth + 1);
+  };
+  visit(err, 0);
+  return layers;
+}
+
+function classifyFetchError(err) {
+  const layers = errorLayers(err);
+  const has = (pred) => layers.some((e) => {
+    try {
+      return pred(String(e?.code ?? ""), String(e?.name ?? ""), String(e?.message ?? (typeof e === "string" ? e : "")));
+    } catch {
+      return false;
+    }
+  });
+  const codeOrText = (codes) => has((code, _n, msg) => codes.includes(code) || codes.some((c) => msg.includes(c)));
+
+  if (has((_c, name) => name === "TimeoutError" || name === "AbortError") || codeOrText(TIMEOUT_CODES)) return "timeout";
+  if (codeOrText(["ECONNREFUSED"])) return "refused";
+  if (codeOrText(DNS_CODES)) return "dns";
+  if (codeOrText(CLOSED_CODES) || has((_c, _n, msg) => /other side closed|socket hang up|socket closed/i.test(msg))) {
+    return "closed";
+  }
+  const status = typeof err?.status === "number" ? err.status : null;
+  if (status !== null) return status >= 500 ? "http5xx" : "http";
+  if (has((_c, name, msg) => name === "TypeError" && /fetch failed|network/i.test(msg))) return "network";
+  return "other";
+}
+
+function originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return String(url ?? "the provider");
+  }
+}
+
+/**
+ * One readable line for a failed /models fetch, never a stack trace. `url` and
+ * `timeoutMs` come from the caller because a mocked or wrapped error may not
+ * carry them.
+ */
+function describeFetchError(err, { url, timeoutMs } = {}) {
+  switch (classifyFetchError(err)) {
+    case "timeout": {
+      const ms = typeof timeoutMs === "number" ? timeoutMs : err?.timeoutMs;
+      return typeof ms === "number" ? `timed out after ${ms}ms` : "timed out";
+    }
+    case "refused":
+      return `connection refused (is ${url ? originOf(url) : "the server"} running?)`;
+    case "dns":
+      return "cannot resolve host";
+    case "closed":
+      return "connection closed";
+    default:
+      if (err instanceof Error || (err && typeof err === "object" && "message" in err)) return String(err.message);
+      return String(err);
+  }
+}
+
+/**
+ * Whether a failure means "the provider is down right now" — routine, logged
+ * as a warning and skipped — rather than a configuration fault such as a 401.
+ */
+function isUnavailable(err) {
+  const kind = classifyFetchError(err);
+  return kind !== "http" && kind !== "other";
 }
 
 // ─── Model-list cache ───────────────────────────────────────────────────────
@@ -614,7 +719,14 @@ function scheduleRefresh(task, settings, log, served) {
           log("warn", "scheduleRefresh", `Could not apply the refreshed list for ${task.providerId}: ${errorDetail(e)}`);
         }
       },
-      (e) => log("warn", "scheduleRefresh", `Background refresh failed for ${task.providerId}: ${errorDetail(e)}`)
+      (e) =>
+        log(
+          "warn",
+          "scheduleRefresh",
+          `Background refresh of ${task.providerId} skipped: ${task.url} is ` +
+            `${isUnavailable(e) ? "unreachable" : "failing"} (${describeFetchError(e, fetchContext(task, settings))}); ` +
+            `keeping the served list`
+        )
     )
   );
 }
@@ -636,6 +748,10 @@ async function readCached(task, settings) {
   } catch {
     return null;
   }
+}
+
+function fetchContext(task, settings) {
+  return { url: task.url, timeoutMs: settings.timeoutMs };
 }
 
 /** `age` is Infinity for a future-dated entry, which must not reach a log line. */
@@ -673,8 +789,9 @@ async function resolveTaskData(task, settings, log) {
     log(
       "warn",
       "resolveTaskData",
-      `Refresh failed for ${task.providerId}; falling back to the expired cached list ` +
-        `(${entry.data.length} model(s), ${describeAge(entry.age)}): ${errorDetail(e)}`
+      `${task.providerId} is ${isUnavailable(e) ? "unreachable" : "failing"} ` +
+        `(${describeFetchError(e, fetchContext(task, settings))}); falling back to the expired cached list ` +
+        `(${entry.data.length} model(s), ${describeAge(entry.age)})`
     );
     return entry.data;
   }
@@ -682,10 +799,13 @@ async function resolveTaskData(task, settings, log) {
 
 /**
  * Fetch every eligible provider in parallel and return the discovered model maps.
+ * Never rejects on a provider's account. Providers that were unreachable are
+ * added to the optional `unavailable` set, so a caller that can keep serving
+ * a last-known inventory (v2) can tell "down" from "serves no models".
  * Runtime-agnostic on purpose: callers decide how to apply the result, so the
  * same core serves the v1 `config` hook and the v2 provider transform.
  */
-async function discoverAll(providers, settings, log) {
+async function discoverAll(providers, settings, log, { unavailable } = {}) {
   const authEntries = await loadAuthEntries(settings, log);
   const tasks = collectProviderTasks(providers, settings, log, authEntries);
 
@@ -726,7 +846,14 @@ async function discoverAll(providers, settings, log) {
     const task = tasks[i];
 
     if (result.status === "rejected") {
-      log("error", "discoverAll", `Discovery failed for ${task.providerId} at ${task.url}: ${errorDetail(result.reason)}`);
+      // A provider that is down is routine: one warning, then the others carry on.
+      const reason = describeFetchError(result.reason, fetchContext(task, settings));
+      if (isUnavailable(result.reason)) {
+        unavailable?.add(task.providerId);
+        log("warn", "discoverAll", `Skipping ${task.providerId}: ${task.url} is unreachable (${reason}); continuing without its models`);
+      } else {
+        log("error", "discoverAll", `Discovery failed for ${task.providerId} at ${task.url}: ${reason}`);
+      }
       continue;
     }
 
@@ -804,6 +931,7 @@ async function settleBackground(settings, log) {
 
 export {
   createLogger,
+  describeFetchError,
   discoverAll,
   errorDetail,
   mergeWithManual,

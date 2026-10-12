@@ -198,8 +198,8 @@ await test("a failing provider is named correctly and does not affect a healthy 
   }, { retries: 0 });
   assert.equal(Object.keys(config.provider.ok.models).length, 3);
   assert.equal(config.provider.bad.models, undefined);
-  assert.match(text, /Discovery failed for bad at https:\/\/broken\.example\/v1\/models/);
-  assert.doesNotMatch(text, /Discovery failed for ok/);
+  assert.match(text, /Skipping bad: https:\/\/broken\.example\/v1\/models is unreachable \(connection refused/);
+  assert.doesNotMatch(text, /Skipping ok/);
 });
 
 await test("an HTTP error is reported with its status", async () => {
@@ -501,6 +501,133 @@ await test("dryRun reports the cache state it would use", async () => {
   assert.match(text, /\[dry-run\] Would serve p from the cached model list/);
 });
 
+// ─── Unreachable providers ──────────────────────────────────────────────────
+
+const { describeFetchError, discoverAll, resolveSettings, createLogger, settleBackground } = await import("../src/core.js");
+
+/** The shape Node's fetch rejects with: the code lives on `cause`. */
+const fetchFailed = (code, message = code) =>
+  Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(message), { code }) });
+
+/** Rejects only when the plugin's own timeout aborts it, like a host that hangs. */
+const hang = (_url, init) =>
+  new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true }));
+
+await test("describeFetchError maps timeout, refused, DNS and socket errors to one readable line", async () => {
+  const ctx = { url: "http://localhost:1234/v1/models", timeoutMs: 50 };
+  assert.equal(describeFetchError(new DOMException("This operation was aborted", "AbortError"), ctx), "timed out after 50ms");
+  assert.equal(
+    describeFetchError(Object.assign(new Error("timed out after 50ms"), { name: "TimeoutError", timeoutMs: 50 })),
+    "timed out after 50ms"
+  );
+  assert.equal(describeFetchError(fetchFailed("ECONNREFUSED"), ctx), "connection refused (is http://localhost:1234 running?)");
+  assert.equal(describeFetchError(new Error("ECONNREFUSED"), ctx), "connection refused (is http://localhost:1234 running?)");
+  assert.equal(
+    describeFetchError(Object.assign(new TypeError("fetch failed"), { cause: new AggregateError([Object.assign(new Error("x"), { code: "ECONNREFUSED" })]) }), ctx),
+    "connection refused (is http://localhost:1234 running?)",
+    "a multi-address host reports through an AggregateError"
+  );
+  assert.equal(describeFetchError(fetchFailed("ENOTFOUND"), ctx), "cannot resolve host");
+  assert.equal(describeFetchError(fetchFailed("EAI_AGAIN"), ctx), "cannot resolve host");
+  assert.equal(describeFetchError(fetchFailed("UND_ERR_SOCKET", "other side closed"), ctx), "connection closed");
+  assert.equal(describeFetchError(Object.assign(new Error("HTTP 401 Unauthorized"), { status: 401 }), ctx), "HTTP 401 Unauthorized");
+});
+
+await test("one provider down, another up: the up one is discovered and the down one only warns", async () => {
+  fetchImpl = async (url) => {
+    if (String(url).includes("down.example")) throw fetchFailed("ECONNREFUSED");
+    return defaultFetch(url);
+  };
+  const { config, messages } = await runHook({
+    provider: {
+      a: provider({ options: { baseURL: "https://down.example/v1" } }),
+      b: provider(),
+    },
+  }, { retries: 0 });
+
+  assert.equal(Object.keys(config.provider.b.models).length, 3);
+  assert.equal(config.provider.a.models, undefined);
+  const aboutA = messages.filter((m) => /\ba\b.*down\.example|Skipping a:/.test(m.message));
+  assert.ok(aboutA.length > 0, "the outage is logged");
+  assert.ok(aboutA.every((m) => m.level === "warn"), JSON.stringify(aboutA));
+  assert.match(aboutA[0].message, /Skipping a: https:\/\/down\.example\/v1\/models is unreachable \(connection refused \(is https:\/\/down\.example running\?\)\)/);
+  assert.equal(messages.filter((m) => m.level === "error").length, 0);
+});
+
+await test("discoverAll resolves with the healthy provider and reports the unreachable one", async () => {
+  fetchImpl = async (url) => {
+    if (String(url).includes("down.example")) throw fetchFailed("ECONNREFUSED");
+    return defaultFetch(url);
+  };
+  const log = createLogger(undefined);
+  const settings = resolveSettings({ cache: false, retries: 0 }, log);
+  const unavailable = new Set();
+  const discoveries = await discoverAll(
+    { a: provider({ options: { baseURL: "https://down.example/v1" } }), b: provider() },
+    settings,
+    log,
+    { unavailable }
+  );
+  assert.deepEqual(discoveries.map((d) => d.task.providerId), ["b"]);
+  assert.deepEqual([...unavailable], ["a"]);
+  await settleBackground(settings, log);
+});
+
+await test("an HTTP 4xx stays an error: it is a configuration fault, not an outage", async () => {
+  const { messages } = await runHook({
+    provider: { p: provider({ options: { baseURL: "https://unauthorized.example/v1" } }) },
+  }, { retries: 0 });
+  const failure = messages.find((m) => /unauthorized\.example/.test(m.message) && m.level !== "info");
+  assert.equal(failure?.level, "error");
+  assert.match(failure.message, /Discovery failed for p at .*: HTTP 401 Unauthorized$/);
+});
+
+await test("a down provider with a stale cache serves the stale list and warns without a stack", async () => {
+  const store = memStore();
+  await runCached({ provider: { p: provider() } }, store);
+  age(store, A_LONG_TIME);
+
+  fetchImpl = async () => { throw fetchFailed("ECONNREFUSED"); };
+  const { config, messages, hooks } = await runCached({ provider: { p: provider() } }, store, { retries: 0, awaitExpired: true });
+  assert.equal(Object.keys(config.provider.p.models).length, 3, "the stale list is served");
+  const warning = messages.find((m) => /falling back to the expired cached list/.test(m.message));
+  assert.equal(warning?.level, "warn");
+  assert.match(warning.message, /p is unreachable \(connection refused \(is https:\/\/api\.example\.com running\?\)\)/);
+  assert.doesNotMatch(warning.message, /native code|\n\s+at /);
+  assert.equal(messages.filter((m) => m.level === "error").length, 0);
+  await hooks.settle();
+});
+
+await test("a timeout is one attempt, not a retry storm", async () => {
+  fetchImpl = hang;
+  const started = Date.now();
+  // The plugin unrefs its abort timer, and the mock has no socket to keep the
+  // loop alive the way a real hung connection would, so the test holds it open.
+  const keepAlive = setInterval(() => {}, 1000);
+  let result;
+  try {
+    result = await runHook({ provider: { p: provider() } }, { timeout: 30, retries: 1, retryDelayMs: 5000 });
+  } finally {
+    clearInterval(keepAlive);
+  }
+  const { config, messages } = result;
+  assert.equal(fetchCount, 1, "a request that burned the whole timeout is not retried");
+  assert.ok(Date.now() - started < 2000, "no backoff was slept");
+  assert.equal(config.provider.p.models, undefined);
+  const warning = messages.find((m) => /Skipping p:/.test(m.message));
+  assert.equal(warning?.level, "warn");
+  assert.match(warning.message, /unreachable \(timed out after 30ms\)/);
+  assert.doesNotMatch(warning.message, /native code/);
+});
+
+await test("a transient 5xx still gets its single retry", async () => {
+  let calls = 0;
+  fetchImpl = async () => (++calls === 1 ? { ok: false, status: 503, statusText: "Service Unavailable" } : defaultFetch("x"));
+  const { config } = await runHook({ provider: { p: provider() } }, { retries: 1, retryDelayMs: 1 });
+  assert.equal(fetchCount, 2);
+  assert.equal(Object.keys(config.provider.p.models).length, 3);
+});
+
 // ─── Non-blocking logger ────────────────────────────────────────────────────
 
 await test("a client.app.log that never resolves does not block the config hook", async () => {
@@ -770,7 +897,11 @@ const v2Provider = (id, settings = {}, pkg = "@opencode/ai/providers/openai-comp
 /** Runs setup(), waits for discovery, and returns the mock plus captured console output. */
 async function runV2(mockOptions = {}, { after } = {}) {
   const out = [];
-  console.info = console.warn = console.error = (...a) => out.push(a.map(String).join(" "));
+  // Tagged by level so a test can tell a warning from an error.
+  const tag = (level) => (...a) => out.push(`${level} ${a.map(String).join(" ")}`);
+  console.info = tag("INFO");
+  console.warn = tag("WARN");
+  console.error = tag("ERROR");
   const m = mockV2(mockOptions);
   const cleanup = await plugin.setup(m.ctx);
   await cleanup.sync();
@@ -892,7 +1023,31 @@ await test("v2: one failing provider does not block another", async () => {
   });
   assert.equal(r.models("good").length, 3);
   assert.equal(r.models("bad").length, 0);
-  assert.match(r.text(), /Discovery failed for bad at https:\/\/broken\.example\/v1\/models/);
+  assert.match(r.text(), /WARN \[auto-models:discoverAll\] Skipping bad: https:\/\/broken\.example\/v1\/models is unreachable/);
+  assert.doesNotMatch(r.text(), /ERROR /);
+});
+
+await test("v2: a provider that goes down keeps its last published inventory across a reload", async () => {
+  const flaky = v2Provider("p", { baseURL: "https://flaky.example/v1" });
+  const r = await runV2({ providers: [flaky], options: { retries: 0 } }, {
+    after: async (m, cleanup) => {
+      assert.equal(m.models("p").length, 3, "published while up");
+      fetchImpl = async (url) => {
+        if (String(url).includes("flaky.example")) throw fetchFailed("ECONNREFUSED");
+        return defaultFetch(url);
+      };
+      // A new provider changes the set, so the next pass re-discovers and reloads.
+      m.setProviders([flaky, v2Provider("q")]);
+      m.emit("provider.updated");
+      await cleanup.sync();
+    },
+  });
+  assert.equal(r.models("q").length, 3, "the new provider is published");
+  assert.equal(r.models("p").length, 3, "the unreachable provider did not vanish on reload");
+  assert.equal(r.calls.reloads, 2);
+  assert.match(r.text(), /WARN \[auto-models:discoverAll\] Skipping p: .* is unreachable \(connection refused/);
+  assert.match(r.text(), /Keeping 3 last-known model\(s\) for p while it is unreachable/);
+  assert.doesNotMatch(r.text(), /ERROR /);
 });
 
 await test("v2: the transform callback is synchronous and does no I/O", async () => {
