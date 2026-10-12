@@ -35,8 +35,10 @@ so a provider configured the same way gets the same models on either version.
   (`@ai-sdk/openai-compatible` on v1; that name, `aisdk:@ai-sdk/openai-compatible`
   or `@opencode/ai/providers/openai-compatible` on v2), or any provider
   explicitly opted in with `autoModels: true`.
-- **Fast startup**: each provider's model list is cached on disk and refreshed
-  in the background, so after the first run discovery needs no network request.
+- **Fast startup**: each provider's model list is cached on disk and served
+  immediately, then refreshed in the background, so after the first run
+  discovery needs no network request on the startup path. On v2 a refresh that
+  changed the list is applied live; on v1 it takes effect on the next start.
 - **Loud about failures**: every provider it skips, and every reason, is logged.
   A plugin that quietly does nothing is indistinguishable from one that is not
   installed, which is the failure mode this is built to avoid.
@@ -103,6 +105,65 @@ entry into the object form:
   ]
 }
 ```
+
+### opencode v2 under WSL and in the Windows desktop app
+
+A WSL install and the Windows desktop app are two separate opencode installs.
+Each has its own global config, its own package cache and its own model cache,
+so the plugin must be installed in each one, and installing it in one does not
+affect the other.
+
+**WSL (Linux).** Run the plugin command inside WSL. opencode installs git
+plugins with the `git` binary of the environment it runs in, so `git` must be
+installed inside WSL (`sudo apt install git` on Ubuntu):
+
+```bash
+opencode --version      # 2.0.x
+opencode plugin add github:BillJr99/opencode-auto-models
+opencode plugin list    # confirms v2 found the plugin
+```
+
+If the git install does not take, use a [local checkout](#local-checkout-v1-or-v2)
+in the WSL filesystem and add its `src` directory to `plugins`, for example
+`"plugins": ["/home/<you>/opencode-auto-models/src"]`.
+
+**Windows desktop app.** The desktop app runs its own Windows-side opencode
+server, which never sees the WSL install. If the Windows `opencode` command is
+on your `PATH`, run the same command from PowerShell. This needs a Windows
+`git` (for example Git for Windows) on the `PATH` of the environment opencode
+runs in, which is the most common reason a git install silently produces
+nothing:
+
+```powershell
+opencode plugin add github:BillJr99/opencode-auto-models
+```
+
+Without the Windows CLI, or if that install does not take, use a local checkout
+on the Windows side and add it to the Windows global config by hand:
+
+```powershell
+git clone https://github.com/BillJr99/opencode-auto-models.git "$env:USERPROFILE\opencode-auto-models"
+cd "$env:USERPROFILE\opencode-auto-models"
+npm install --omit=dev
+```
+
+```json
+{
+  "plugins": ["C:/Users/<You>/opencode-auto-models/src"]
+}
+```
+
+Restart the desktop app afterwards. Running `opencode plugin add` once with the
+Windows CLI is the surest way to find the config file the desktop app reads,
+since the command writes to it. Do not point the Windows app at a checkout
+inside WSL (`\\wsl$\...`): its `node_modules` were installed for Linux and the
+path is only reachable while WSL is running.
+
+The desktop app does not show v2 plugin output, so check that the plugin loaded
+with a foreground server as described under [Troubleshooting](#troubleshooting);
+in PowerShell, set the password with `$env:OPENCODE_PASSWORD = "secret"` before
+running `opencode serve`. To force a reinstall, clear the package cache on the
+side that is misbehaving, as shown below.
 
 ### Local checkout (v1 or v2)
 
@@ -313,18 +374,37 @@ The options are the same on both versions:
 | `cache` | `true` | Cache each provider's model list on disk (see [Startup cost](#startup-cost)). |
 | `cacheTtl` | `86400000` | Cache lifetime in milliseconds, 24 hours by default. |
 | `cacheDir` | auto | Override the cache directory. |
+| `awaitExpired` | `false` | Refetch an entry older than `cacheTtl` before applying it, rather than serving it and refreshing in the background. |
 | `refresh` | `false` | Ignore cached entries for this run and refetch everything. |
 | `authFile` | auto on v1, unset on v2 | Path to opencode's `auth.json`. See the credential order above. |
 
 ## Startup cost
 
-Each provider's raw `/models` response is cached on disk. A start that finds a
-fresh entry applies it immediately and issues no request on the startup path,
-then refreshes the list in the background for the next start. Only a first
-run, a newly added provider, or an entry older than `cacheTtl` fetches before
-the models are applied, and an expired entry whose refetch fails is still used
-rather than leaving you with no models. Startup is therefore one refresh
-behind, on both versions.
+Each provider's raw `/models` response is cached on disk, and discovery is
+stale-while-revalidate:
+
+- **Cache exists** (fresh or expired): the cached list is applied immediately,
+  with no request on the startup path, and the list is refetched in the
+  background. A failed refresh leaves the served list and the cache entry as
+  they were.
+- **No cache** (a first run or a newly added provider): the list is fetched
+  before the models are applied, and the cache is written.
+
+What happens to a background refresh depends on the version. **v2** compares
+the refreshed list with the one it served and, if they differ, republishes the
+inventory with `ctx.provider.reload()`, so new or removed models appear in the
+running session a moment later. **v1** builds its model catalog once, from the
+config hook, and has no way to rebuild it, so on v1 the refreshed list takes
+effect on the next start.
+
+`cacheTtl` therefore no longer decides whether startup waits; it marks an
+entry as expired, which only changes the log line. Set `awaitExpired: true` to
+restore the blocking behavior: an expired entry is then refetched before the
+models are applied, and served only if that refetch fails. This is mostly
+useful on v1, where it trades a slower start after expiry for never running a
+whole session on a list older than `cacheTtl`. An entry dated in the future
+(clock skew, a resumed VM) is always refetched first, because its age is
+unknown.
 
 The raw response is what gets cached, not the processed model list, so editing
 `autoModelsInclude`, `autoModelsExclude`, `modelLimits` or the context defaults
@@ -433,8 +513,10 @@ providers or credentials changed (`provider.updated`, `credential.updated`,
 `credential.switched`). A provider set that has not changed since the last run
 is a no-op, so the plugin's own reload never triggers another discovery.
 
-The background cache refresh does not reload the live inventory. As on v1, a
-refreshed list takes effect on the next start.
+A background cache refresh that changed a provider's list triggers one more
+discovery pass, which reads the refreshed entry and reloads the inventory. An
+unchanged refresh does nothing, and the extra pass never schedules a refresh of
+its own.
 
 ### Differences between v1 and v2
 
@@ -444,6 +526,7 @@ refreshed list takes effect on the next start.
 | Plugin config | `plugin: [url \| [url, options]]` | `plugins: [package \| { package, options }]` |
 | Entry point | `server()` → `config` hook | `setup(ctx)` → `ctx.provider.transform` |
 | Models visible | before the catalog is built | a moment after startup (see [Startup cost](#startup-cost)) |
+| Background refresh | takes effect on the next start | applied live when the list changed |
 | Providers considered | only those in your config | those in your config; opencode's built-in providers (models.dev, bundled integrations) only with `autoModels: true` |
 | Credential order | `apiKey`, then `auth.json` | active connection, then `apiKey`, then `auth.json` only if configured |
 | Manual model metadata | shallow-merged over the discovered entry | applied by opencode over the discovered entry, field by field (for example, a manual `limit.context` keeps the discovered `limit.output`) |

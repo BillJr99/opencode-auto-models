@@ -324,6 +324,17 @@ export async function setupV2(ctx) {
     return running;
   }
 
+  // A cached list is served at once and refreshed in the background. Unlike
+  // v1, v2 can rebuild its inventory, so a refresh that changed the list is
+  // applied now: forgetting the fingerprint lets the next pass run even though
+  // the provider set is the same, and that pass reads the refreshed cache entry
+  // (the core's per-entry guard keeps it from refreshing a second time).
+  settings.onRefresh = () => {
+    if (disposed) return;
+    fingerprint = "";
+    sync();
+  };
+
   /** @type {AsyncIterator<any> | undefined} */
   let events;
   if (typeof ctx.event?.subscribe === "function") {

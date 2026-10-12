@@ -347,26 +347,56 @@ await test("a fresh entry still honours the current filters, with no refetch", a
   await hooks.settle();
 });
 
-await test("an expired entry is refetched before startup continues", async () => {
+await test("an expired entry is served at once and refreshed in the background", async () => {
+  const store = memStore();
+  await runCached({ provider: { p: provider() } }, store);
+  age(store, A_LONG_TIME);
+
+  let release;
+  fetchImpl = () => new Promise((r) => { release = () => r(payload(["fresh-1"])); });
+  // If startup awaited the refetch this would never resolve.
+  const { config, hooks, text } = await runCached({ provider: { p: provider() } }, store);
+  assert.equal(Object.keys(config.provider.p.models).length, 3, "the expired list is served without waiting");
+  assert.match(text, /Serving p from the expired cached model list/);
+
+  release();
+  await hooks.settle();
+  assert.deepEqual(JSON.parse([...store.map.values()][0]).data.map((m) => m.id), ["fresh-1"], "and the cache is refreshed");
+});
+
+await test("awaitExpired: true refetches an expired entry before startup continues", async () => {
   const store = memStore();
   await runCached({ provider: { p: provider() } }, store);
   age(store, A_LONG_TIME);
 
   fetchImpl = async () => payload(["fresh-1"]);
-  const { config, hooks } = await runCached({ provider: { p: provider() } }, store);
+  const { config, hooks } = await runCached({ provider: { p: provider() } }, store, { awaitExpired: true });
   assert.deepEqual(Object.keys(config.provider.p.models), ["fresh-1"]);
   await hooks.settle();
 });
 
-await test("an expired entry is served when the refetch fails", async () => {
+await test("awaitExpired: true serves the expired entry when the refetch fails", async () => {
   const store = memStore();
   await runCached({ provider: { p: provider() } }, store);
   age(store, A_LONG_TIME);
 
   fetchImpl = async () => { throw new Error("ECONNREFUSED"); };
-  const { config, text } = await runCached({ provider: { p: provider() } }, store, { retries: 0 });
+  const { config, text } = await runCached({ provider: { p: provider() } }, store, { retries: 0, awaitExpired: true });
   assert.equal(Object.keys(config.provider.p.models).length, 3, "stale models beat no models");
   assert.match(text, /falling back to the expired cached list/);
+});
+
+await test("a failed background refresh of an expired entry keeps the served list", async () => {
+  const store = memStore();
+  await runCached({ provider: { p: provider() } }, store);
+  age(store, A_LONG_TIME);
+
+  fetchImpl = async () => { throw new Error("ECONNREFUSED"); };
+  const { config, hooks } = await runCached({ provider: { p: provider() } }, store, { retries: 0 });
+  assert.equal(Object.keys(config.provider.p.models).length, 3);
+  await hooks.settle();
+  await hooks.flushLogs();
+  assert.equal(JSON.parse([...store.map.values()][0]).data.length, 3, "a failed refresh never overwrites the entry");
 });
 
 await test("a savedAt in the future is treated as expired, not fresh", async () => {
@@ -425,7 +455,8 @@ await test("autoModelsCacheTtl expires an entry per provider", async () => {
   fetchImpl = async () => payload(["hourly"]);
   const { config, hooks } = await runCached(
     { provider: { p: provider({ options: { autoModelsCacheTtl: 1000 } }) } },
-    store
+    store,
+    { awaitExpired: true }
   );
   assert.deepEqual(Object.keys(config.provider.p.models), ["hourly"]);
   await hooks.settle();
@@ -906,6 +937,67 @@ await test("v2: a warm cache serves discovery with the network down", async () =
   const r = await runV2({ providers: [v2Provider("p")], options: { cache: true, cacheStore: store } });
   assert.equal(r.models("p").length, 3);
   assert.match(r.text(), /Serving p from the cached model list/);
+});
+
+await test("v2: a background refresh that changes the list is applied live", async () => {
+  const store = memStore();
+  await runV2({ providers: [v2Provider("p")], options: { cache: true, cacheStore: store } });
+
+  let release;
+  fetchCount = 0;
+  fetchImpl = () => new Promise((r) => { release = () => r(payload(["new-1", "new-2"])); });
+  const r = await runV2(
+    { providers: [v2Provider("p")], options: { cache: true, cacheStore: store } },
+    {
+      after: async (m, cleanup) => {
+        assert.equal(m.models("p").length, 3, "the cached list is published first");
+        const reloads = m.calls.reloads;
+        release();
+        await cleanup.settle();
+        await cleanup.sync();
+        assert.deepEqual(m.models("p").map((x) => x.id), ["new-1", "new-2"], "then replaced by the refreshed one");
+        assert.equal(m.calls.reloads, reloads + 1, "with exactly one more reload");
+      },
+    }
+  );
+  assert.match(r.text(), /Refreshed the cached model list for p \(2 model\(s\)\); applying it now/);
+  assert.equal(fetchCount, 1, "the live re-apply does not refresh a second time");
+});
+
+await test("v2: an unchanged background refresh does not reload", async () => {
+  const store = memStore();
+  await runV2({ providers: [v2Provider("p")], options: { cache: true, cacheStore: store } });
+  const r = await runV2(
+    { providers: [v2Provider("p")], options: { cache: true, cacheStore: store } },
+    {
+      after: async (m, cleanup) => {
+        const reloads = m.calls.reloads;
+        await cleanup.settle();
+        await cleanup.sync();
+        assert.equal(m.calls.reloads, reloads);
+      },
+    }
+  );
+  assert.match(r.text(), /Refreshed the cached model list for p \(3 model\(s\)\); unchanged/);
+});
+
+await test("v2: an expired cache is published at once and refreshed live", async () => {
+  const store = memStore();
+  await runV2({ providers: [v2Provider("p")], options: { cache: true, cacheStore: store } });
+  age(store, A_LONG_TIME);
+
+  fetchImpl = async () => payload(["new-1"]);
+  const r = await runV2(
+    { providers: [v2Provider("p")], options: { cache: true, cacheStore: store } },
+    {
+      after: async (m, cleanup) => {
+        await cleanup.settle();
+        await cleanup.sync();
+      },
+    }
+  );
+  assert.match(r.text(), /Serving p from the expired cached model list/);
+  assert.deepEqual(r.models("p").map((x) => x.id), ["new-1"]);
 });
 
 await test("v2: ${NAME} in baseURL is expanded the way opencode expands it", async () => {
