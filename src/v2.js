@@ -283,7 +283,9 @@ export async function setupV2(ctx) {
       );
     }
     log("info", "setup", `Discovery running over ${Object.keys(providers).length} configured provider(s)`);
-    const discoveries = await discoverAll(providers, settings, log);
+    /** @type {Set<string>} */
+    const unavailable = new Set();
+    const discoveries = await discoverAll(providers, settings, log, { unavailable });
 
     /** @type {Map<string, CapturedProvider>} */
     const nextCaptured = new Map();
@@ -295,6 +297,17 @@ export async function setupV2(ctx) {
       log("info", "setup", `Discovered ${models.length} model(s) for ${task.providerId}`, {
         models: Object.keys(discovered),
       });
+    }
+
+    // A provider that is only temporarily down keeps what it last published:
+    // the reload another provider triggers must not make its models vanish.
+    // One that left the config, or answered with no models, still drops out.
+    for (const providerID of unavailable) {
+      const previous = captured.get(providerID);
+      const entry = infos.get(providerID);
+      if (!previous || !entry || nextCaptured.has(providerID)) continue;
+      nextCaptured.set(providerID, { info: entry.info, models: previous.models, connection: entry.connection });
+      log("info", "setup", `Keeping ${previous.models.length} last-known model(s) for ${providerID} while it is unreachable`);
     }
 
     const changed = JSON.stringify([...nextCaptured]) !== JSON.stringify([...captured]);
