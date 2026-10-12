@@ -287,6 +287,11 @@ function isUnavailable(err) {
   return kind !== "http" && kind !== "other";
 }
 
+/** An HTTP 4xx from /models: the server answered, but refused this request. */
+function isHttpClientError(err) {
+  return classifyFetchError(err) === "http";
+}
+
 // ─── Model-list cache ───────────────────────────────────────────────────────
 
 /**
@@ -851,6 +856,10 @@ async function discoverAll(providers, settings, log, { unavailable } = {}) {
       if (isUnavailable(result.reason)) {
         unavailable?.add(task.providerId);
         log("warn", "discoverAll", `Skipping ${task.providerId}: ${task.url} is unreachable (${reason}); continuing without its models`);
+      } else if (isHttpClientError(result.reason)) {
+        // A 4xx (bad key, wrong path) is worth a clear line but is no more fatal
+        // than an outage: the other providers carry on either way.
+        log("warn", "discoverAll", `Skipping ${task.providerId}: ${task.url} returned ${reason}; continuing without its models`);
       } else {
         log("error", "discoverAll", `Discovery failed for ${task.providerId} at ${task.url}: ${reason}`);
       }

@@ -573,13 +573,15 @@ await test("discoverAll resolves with the healthy provider and reports the unrea
   await settleBackground(settings, log);
 });
 
-await test("an HTTP 4xx stays an error: it is a configuration fault, not an outage", async () => {
-  const { messages } = await runHook({
-    provider: { p: provider({ options: { baseURL: "https://unauthorized.example/v1" } }) },
+await test("an HTTP 4xx is a warning too: the provider is skipped and the others carry on", async () => {
+  const { config, messages } = await runHook({
+    provider: { p: provider({ options: { baseURL: "https://unauthorized.example/v1" } }), ok: provider() },
   }, { retries: 0 });
+  assert.equal(Object.keys(config.provider.ok.models).length, 3);
   const failure = messages.find((m) => /unauthorized\.example/.test(m.message) && m.level !== "info");
-  assert.equal(failure?.level, "error");
-  assert.match(failure.message, /Discovery failed for p at .*: HTTP 401 Unauthorized$/);
+  assert.equal(failure?.level, "warn");
+  assert.match(failure.message, /Skipping p: https:\/\/unauthorized\.example\/v1\/models returned HTTP 401 Unauthorized; continuing without its models$/);
+  assert.equal(messages.filter((m) => m.level === "error").length, 0);
 });
 
 await test("a down provider with a stale cache serves the stale list and warns without a stack", async () => {
